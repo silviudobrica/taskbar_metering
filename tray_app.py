@@ -790,8 +790,10 @@ class MeterTray(QObject):
         if not active_list:
             active_list = ["cpu_usage"]
             
-        # Create tray icons in normal order to match active_list sequence from left-to-right
-        for key in active_list:
+        # Create tray icons in reversed order because Windows prepends new system tray icons
+        # (meaning the last one registered is shown on the left). Reversing this ensures
+        # the taskbar layout matches active_list sequence from left-to-right.
+        for key in reversed(active_list):
             tray_icon = QSystemTrayIcon(self)
             tray_icon.activated.connect(self.on_tray_activated)
             tray_icon.setContextMenu(self.menu)
