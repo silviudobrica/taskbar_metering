@@ -11,6 +11,8 @@ DEFAULT_CONFIG = {
     "launch_on_startup": True
 }
 
+APP_IPC_SERVER_NAME = "TaskbarMeteringIPC"
+
 def get_config_dir():
     # Store settings in standard Windows Local AppData
     appdata = os.environ.get("LOCALAPPDATA")

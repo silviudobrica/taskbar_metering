@@ -1,15 +1,46 @@
 import sys
 import os
+import time
 import shutil
 import subprocess
 import winreg
 from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QLineEdit, QFileDialog, QCheckBox, 
-                             QMessageBox, QGraphicsDropShadowEffect)
+                             QMessageBox, QGraphicsDropShadowEffect, QApplication)
 from PySide6.QtGui import QFont, QColor, QLinearGradient, QPalette, QBrush
 from PySide6.QtCore import Qt, QSize
+from PySide6.QtNetwork import QLocalSocket
 
 import config
+
+
+def _is_running_inside_app_process():
+    app = QApplication.instance()
+    return bool(app and hasattr(app, "tray_ref"))
+
+
+def request_running_instance_exit(wait_seconds=8):
+    socket = QLocalSocket()
+    socket.connectToServer(config.APP_IPC_SERVER_NAME)
+    if not socket.waitForConnected(600):
+        return True
+
+    socket.write(b"UNINSTALL\n")
+    socket.flush()
+    socket.waitForBytesWritten(600)
+    socket.disconnectFromServer()
+
+    deadline = time.monotonic() + max(1, wait_seconds)
+    while time.monotonic() < deadline:
+        probe = QLocalSocket()
+        probe.connectToServer(config.APP_IPC_SERVER_NAME)
+        if not probe.waitForConnected(250):
+            return True
+        probe.disconnectFromServer()
+        probe.waitForDisconnected(200)
+        time.sleep(0.2)
+
+    return False
 
 class InstallerWindow(QWidget):
     def __init__(self, run_app_callback):
@@ -299,6 +330,18 @@ def run_uninstallation():
     if confirm != 1: # 1 is IDOK, 2 is IDCANCEL
         print("Uninstallation cancelled by user.")
         return # Do nothing!
+
+    # If uninstall is launched from outside the running tray process,
+    # ask the active instance to quit first so file cleanup can succeed.
+    if not _is_running_inside_app_process():
+        if not request_running_instance_exit():
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Taskbar Metering is still running and could not be stopped automatically.\nPlease close it and retry uninstall.",
+                "Uninstall Blocked",
+                0x10 | 0x0
+            )
+            return
 
     # 2. Remove Registry Key for Startup
     try:

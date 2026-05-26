@@ -1,14 +1,17 @@
 import sys
 import os
 import time
+import ctypes
+from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QWidget, 
                              QLabel, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QDialog, QAbstractItemView,
                              QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea)
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
-                           QAction, QActionGroup, QCursor, QPainterPath)
+                           QAction, QActionGroup, QCursor, QPainterPath, QGuiApplication)
 from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject, QSharedMemory
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 import config
 import metrics
@@ -135,6 +138,87 @@ def migrate_config_keys():
 # Pre-populate dynamic disk sensors immediately
 initialize_dynamic_sensors()
 migrate_config_keys()
+
+
+def send_ipc_command(command, timeout_ms=1200):
+    socket = QLocalSocket()
+    socket.connectToServer(config.APP_IPC_SERVER_NAME)
+    if not socket.waitForConnected(timeout_ms):
+        return False
+
+    payload = f"{command.strip()}\n".encode("utf-8")
+    socket.write(payload)
+    socket.flush()
+    socket.waitForBytesWritten(timeout_ms)
+    socket.waitForReadyRead(timeout_ms)
+    socket.disconnectFromServer()
+    socket.waitForDisconnected(200)
+    return True
+
+
+class TaskbarAnchor:
+    ABM_GETTASKBARPOS = 0x00000005
+
+    class APPBARDATA(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uCallbackMessage", wintypes.UINT),
+            ("uEdge", wintypes.UINT),
+            ("rc", wintypes.RECT),
+            ("lParam", ctypes.c_long),
+        ]
+
+    def _taskbar_rect(self):
+        if os.name != "nt":
+            return None
+        try:
+            data = self.APPBARDATA()
+            data.cbSize = ctypes.sizeof(self.APPBARDATA)
+            result = ctypes.windll.shell32.SHAppBarMessage(self.ABM_GETTASKBARPOS, ctypes.byref(data))
+            if result:
+                return data.rc
+        except Exception:
+            pass
+        return None
+
+    def get_widget_position(self, width, height, margin=10):
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 0, 0
+
+        geom = screen.geometry()
+        avail = screen.availableGeometry()
+        x = avail.right() - width - margin
+        y = avail.bottom() - height - margin
+
+        taskbar = self._taskbar_rect()
+        if taskbar is not None:
+            t_left = int(taskbar.left)
+            t_top = int(taskbar.top)
+            t_right = int(taskbar.right)
+            t_bottom = int(taskbar.bottom)
+            t_width = t_right - t_left
+            t_height = t_bottom - t_top
+
+            if t_width >= t_height:
+                if t_top <= geom.top() + 4:
+                    x = t_right - width - margin
+                    y = t_bottom + margin
+                else:
+                    x = t_right - width - margin
+                    y = t_top - height - margin
+            else:
+                if t_left <= geom.left() + 4:
+                    x = t_right + margin
+                    y = avail.bottom() - height - margin
+                else:
+                    x = t_left - width - margin
+                    y = avail.bottom() - height - margin
+
+        x = max(geom.left() + margin, min(x, geom.right() - width - margin))
+        y = max(geom.top() + margin, min(y, geom.bottom() - height - margin))
+        return x, y
 
 
 class CircularProgress(QWidget):
@@ -465,7 +549,14 @@ class FlyoutPanel(QWidget):
         self.exit_callback = exit_callback
         self.cfg = config.load_config()
         self.cards = {}
+        self.anchor = TaskbarAnchor()
         self.init_ui()
+        self._connect_screen_signals()
+
+        self._reanchor_timer = QTimer(self)
+        self._reanchor_timer.setInterval(1500)
+        self._reanchor_timer.timeout.connect(self._reanchor_if_visible)
+        self._reanchor_timer.start()
         
     def init_ui(self):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -495,6 +586,10 @@ class FlyoutPanel(QWidget):
                 font-size: 13px;
                 font-weight: bold;
                 color: #90A4AE;
+            }
+            QLabel#MetricSub {
+                font-size: 10px;
+                color: #607D8B;
             }
             QPushButton#IconBtn {
                 background-color: transparent;
@@ -601,8 +696,11 @@ class FlyoutPanel(QWidget):
             lbl.setObjectName("MetricLabel")
             val_lbl = QLabel("--")
             val_lbl.setObjectName("MetricVal")
+            sub_lbl = QLabel("Waiting for sample")
+            sub_lbl.setObjectName("MetricSub")
             text_layout.addWidget(lbl)
             text_layout.addWidget(val_lbl)
+            text_layout.addWidget(sub_lbl)
             card_layout.addLayout(text_layout)
             
             card_layout.addStretch()
@@ -611,6 +709,7 @@ class FlyoutPanel(QWidget):
             self.cards[key] = {
                 "progress_widget": progress,
                 "value_label": val_lbl,
+                "status_label": sub_lbl,
                 "meta": meta
             }
             
@@ -619,10 +718,12 @@ class FlyoutPanel(QWidget):
         self.setFixedSize(300, min(max(dyn_height, 150), 550))
         self.main_container.setFixedSize(self.width(), self.height())
         
-    def update_metrics(self, values):
+    def update_metrics(self, values, freshness=None):
+        freshness = freshness or {}
         for key, widgets in self.cards.items():
             val = values.get(key)
             meta = widgets["meta"]
+            fresh_info = freshness.get(key, {})
             
             widgets["progress_widget"].set_value(val, meta["max"], meta["unit"])
             
@@ -633,19 +734,163 @@ class FlyoutPanel(QWidget):
                     widgets["value_label"].setText(f"{val:.1f}{meta['unit']}")
             else:
                 widgets["value_label"].setText("N/A")
+
+            widgets["status_label"].setText(self._format_freshness(fresh_info, val))
                 
     def position_above_clock(self):
-        screen = QApplication.primaryScreen()
-        geom = screen.availableGeometry()
-        
-        x = geom.right() - self.width() - 10
-        y = geom.bottom() - self.height() - 10
+        x, y = self.anchor.get_widget_position(self.width(), self.height(), margin=10)
         self.move(x, y)
+
+    def _connect_screen_signals(self):
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+
+        app.screenAdded.connect(lambda _screen: self._schedule_reanchor())
+        app.screenRemoved.connect(lambda _screen: self._schedule_reanchor())
+        for screen in app.screens():
+            try:
+                screen.geometryChanged.connect(lambda _geom: self._schedule_reanchor())
+                screen.availableGeometryChanged.connect(lambda _geom: self._schedule_reanchor())
+            except Exception:
+                pass
+
+    def _schedule_reanchor(self):
+        QTimer.singleShot(120, self._reanchor_if_visible)
+
+    def _reanchor_if_visible(self):
+        if self.isVisible():
+            self.position_above_clock()
+
+    def _format_freshness(self, info, value):
+        if value is None:
+            return "Unavailable"
+
+        state = info.get("state", "fresh")
+        updated_at = info.get("updated_at")
+        if updated_at is None:
+            return "Live sample"
+
+        age = max(0, int(time.time() - updated_at))
+        if state == "cached":
+            return f"Cached {age}s ago"
+        return "Live sample"
         
     def changeEvent(self, event):
         if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
             self.hide()
         super().changeEvent(event)
+
+
+class TaskbarCompanionBar(QWidget):
+    """Compact always-on bar anchored near the clock with live metric text."""
+    def __init__(self, menu, toggle_flyout_callback, parent=None):
+        super().__init__(parent)
+        self.menu = menu
+        self.toggle_flyout_callback = toggle_flyout_callback
+        self.anchor = TaskbarAnchor()
+        self.labels = {}
+        self.active_keys = []
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+        self.container = QWidget(self)
+        self.container.setObjectName("CompanionContainer")
+        self.container.setStyleSheet("""
+            QWidget#CompanionContainer {
+                background-color: rgba(18, 18, 20, 0.88);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 8px;
+            }
+            QLabel#CompanionMetric {
+                color: #ECEFF1;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 0 2px;
+            }
+        """)
+
+        self.layout_main = QHBoxLayout(self.container)
+        self.layout_main.setContentsMargins(10, 6, 10, 6)
+        self.layout_main.setSpacing(10)
+
+        self.rebuild_sensors(["cpu_usage", "ram_usage"])
+
+        self._anchor_timer = QTimer(self)
+        self._anchor_timer.setInterval(1500)
+        self._anchor_timer.timeout.connect(self.reanchor)
+        self._anchor_timer.start()
+
+        self.show()
+        self.reanchor()
+
+    def rebuild_sensors(self, active_keys):
+        self.active_keys = list(active_keys)
+
+        while self.layout_main.count():
+            child = self.layout_main.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        self.labels.clear()
+        for key in self.active_keys:
+            if key not in SENSOR_METADATA:
+                continue
+            label = QLabel(f"{SENSOR_METADATA[key]['short']}: --")
+            label.setObjectName("CompanionMetric")
+            self.layout_main.addWidget(label)
+            self.labels[key] = label
+
+        self.layout_main.addStretch()
+        self._resize_to_content()
+
+    def update_metrics(self, values, freshness):
+        for key, label in self.labels.items():
+            meta = SENSOR_METADATA.get(key)
+            if not meta:
+                continue
+            val = values.get(key)
+            info = freshness.get(key, {})
+            state = info.get("state", "fresh")
+            suffix = "*" if state == "cached" else ""
+
+            if val is None:
+                label.setText(f"{meta['short']}: N/A")
+            elif "temp" in key:
+                label.setText(f"{meta['short']}: {val}{meta['unit']}{suffix}")
+            else:
+                label.setText(f"{meta['short']}: {val:.0f}{meta['unit']}{suffix}")
+
+        self._resize_to_content()
+        self.reanchor()
+
+    def _resize_to_content(self):
+        self.container.adjustSize()
+        width = max(220, self.container.sizeHint().width())
+        height = max(32, self.container.sizeHint().height())
+        self.setFixedSize(width, height)
+        self.container.setFixedSize(width, height)
+
+    def _show_context_menu(self, _pos):
+        self.menu.exec(QCursor.pos())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_flyout_callback()
+        elif event.button() == Qt.RightButton:
+            self.menu.exec(QCursor.pos())
+        super().mousePressEvent(event)
+
+    def reanchor(self):
+        x, y = self.anchor.get_widget_position(self.width(), self.height(), margin=8)
+        self.move(x, y)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.reanchor()
 
 
 class MeterTray(QObject):
@@ -659,17 +904,23 @@ class MeterTray(QObject):
         
         self.menu = QMenu()
         self.setup_menu()
+
+        self._ipc_server = None
+        self.setup_ipc_server()
         
         self.flyout = FlyoutPanel(self.open_config_dialog, self.quit_app)
+        self.companion_bar = TaskbarCompanionBar(self.menu, self.toggle_flyout)
 
         # Keep expensive temperature probes off the UI polling path.
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._cpu_temp_future = None
         self._cpu_temp_cache = None
+        self._cpu_temp_updated_at = None
         self._cpu_temp_last_request = 0.0
         self._cpu_temp_min_interval = 10.0
         self._disk_temp_futures = {}
         self._disk_temp_cache = {}
+        self._disk_temp_updated_at = {}
         self._disk_temp_last_request = {}
         self._disk_temp_min_interval = 20.0
         
@@ -775,6 +1026,7 @@ class MeterTray(QObject):
     def on_config_saved(self):
         self.cfg = config.load_config()
         self.flyout.rebuild_cards()
+        self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
         self.rebuild_tray_icons()
         self.poll_metrics()
         
@@ -815,8 +1067,9 @@ class MeterTray(QObject):
             
     def poll_metrics(self):
         now = time.monotonic()
+        wall_now = time.time()
         cpu_usage = metrics.get_cpu_usage()
-        cpu_temp = self._get_cpu_temp_cached(now)
+        cpu_temp, cpu_temp_info = self._get_cpu_temp_cached(now)
         ram_usage = metrics.get_ram_usage()
         gpu_usage, gpu_temp = metrics.get_gpu_metrics()
         disk_usage_list = metrics.get_disk_usage()
@@ -828,6 +1081,13 @@ class MeterTray(QObject):
             "gpu_usage": gpu_usage,
             "gpu_temp": gpu_temp
         }
+        freshness = {
+            "cpu_usage": {"state": "fresh", "updated_at": wall_now},
+            "cpu_temp": cpu_temp_info,
+            "ram_usage": {"state": "fresh", "updated_at": wall_now},
+            "gpu_usage": {"state": "fresh", "updated_at": wall_now},
+            "gpu_temp": {"state": "fresh", "updated_at": wall_now},
+        }
         
         # Populate each dynamic disk partition usage and temperature
         for d in disk_usage_list:
@@ -836,11 +1096,13 @@ class MeterTray(QObject):
             
             usage_key = f"disk_usage_{dev_clean}"
             values[usage_key] = d["percent"]
+            freshness[usage_key] = {"state": "fresh", "updated_at": wall_now}
             
             temp_key = f"disk_temp_{dev_clean}"
-            values[temp_key] = self._get_drive_temp_cached(dev_name, now)
+            values[temp_key], freshness[temp_key] = self._get_drive_temp_cached(dev_name, now)
         
-        self.flyout.update_metrics(values)
+        self.flyout.update_metrics(values, freshness)
+        self.companion_bar.update_metrics(values, freshness)
         
         # Guard in case config mismatch
         if len(self.tray_icons) != len([k for k in self.cfg.get("active_sensors", []) if k in SENSOR_METADATA]):
@@ -862,6 +1124,8 @@ class MeterTray(QObject):
                     tooltip = f"{meta['label']}: {val:.1f}{meta['unit']}"
             else:
                 tooltip = f"{meta['label']}: N/A"
+            if freshness.get(key, {}).get("state") == "cached":
+                tooltip = f"{tooltip} (cached)"
             tray_icon.setToolTip(f"Taskbar Metering\n{tooltip}")
             
     def create_sensor_icon(self, key, val):
@@ -920,10 +1184,45 @@ class MeterTray(QObject):
         else:
             self.quit_app()
 
+    def setup_ipc_server(self):
+        try:
+            QLocalServer.removeServer(config.APP_IPC_SERVER_NAME)
+        except Exception:
+            pass
+
+        self._ipc_server = QLocalServer(self)
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        self._ipc_server.listen(config.APP_IPC_SERVER_NAME)
+
+    def _on_ipc_connection(self):
+        while self._ipc_server and self._ipc_server.hasPendingConnections():
+            socket = self._ipc_server.nextPendingConnection()
+            socket.readyRead.connect(lambda s=socket: self._handle_ipc_socket(s))
+            socket.disconnected.connect(socket.deleteLater)
+
+    def _handle_ipc_socket(self, socket):
+        raw = bytes(socket.readAll()).decode("utf-8", errors="ignore")
+        commands = [line.strip().upper() for line in raw.splitlines() if line.strip()]
+        for cmd in commands:
+            if cmd in ("EXIT", "UNINSTALL"):
+                QTimer.singleShot(0, self.quit_app)
+            elif cmd in ("SHOW", "TOGGLE"):
+                QTimer.singleShot(0, self.toggle_flyout)
+
+        try:
+            socket.write(b"OK\n")
+            socket.flush()
+        except Exception:
+            pass
+        socket.disconnectFromServer()
+
     def _get_cpu_temp_cached(self, now):
+        completed_now = False
         if self._cpu_temp_future and self._cpu_temp_future.done():
             try:
                 self._cpu_temp_cache = self._cpu_temp_future.result()
+                self._cpu_temp_updated_at = time.time()
+                completed_now = True
             except Exception:
                 pass
             self._cpu_temp_future = None
@@ -932,13 +1231,17 @@ class MeterTray(QObject):
             self._cpu_temp_last_request = now
             self._cpu_temp_future = self._executor.submit(metrics.get_cpu_temp)
 
-        return self._cpu_temp_cache
+        state = "fresh" if completed_now else ("cached" if self._cpu_temp_cache is not None else "unknown")
+        return self._cpu_temp_cache, {"state": state, "updated_at": getattr(self, "_cpu_temp_updated_at", None)}
 
     def _get_drive_temp_cached(self, drive_letter, now):
+        completed_now = False
         future = self._disk_temp_futures.get(drive_letter)
         if future and future.done():
             try:
                 self._disk_temp_cache[drive_letter] = future.result()
+                self._disk_temp_updated_at[drive_letter] = time.time()
+                completed_now = True
             except Exception:
                 pass
             self._disk_temp_futures.pop(drive_letter, None)
@@ -948,12 +1251,21 @@ class MeterTray(QObject):
             self._disk_temp_last_request[drive_letter] = now
             self._disk_temp_futures[drive_letter] = self._executor.submit(metrics.get_drive_temp, drive_letter)
 
-        return self._disk_temp_cache.get(drive_letter)
+        val = self._disk_temp_cache.get(drive_letter)
+        state = "fresh" if completed_now else ("cached" if val is not None else "unknown")
+        return val, {"state": state, "updated_at": self._disk_temp_updated_at.get(drive_letter)}
             
     def quit_app(self):
         for _, icon in self.tray_icons:
             icon.hide()
+        self.companion_bar.hide()
         self.flyout.hide()
+        if self._ipc_server:
+            try:
+                self._ipc_server.close()
+                QLocalServer.removeServer(config.APP_IPC_SERVER_NAME)
+            except Exception:
+                pass
         self._executor.shutdown(wait=False)
         metrics.cleanup_metrics()
         QApplication.quit()
@@ -966,6 +1278,7 @@ def run_app(uninstall_callback=None):
 
     singleton = QSharedMemory("TaskbarMeteringSingleton")
     if not singleton.create(1):
+        send_ipc_command("SHOW")
         return
     app.singleton_lock = singleton
 
