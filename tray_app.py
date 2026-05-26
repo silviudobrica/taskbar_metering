@@ -791,6 +791,9 @@ class TaskbarCompanionBar(QWidget):
         self.anchor = TaskbarAnchor()
         self.labels = {}
         self.active_keys = []
+        self.hidden_count = 0
+        self._last_layout_limit = None
+        self.compact_three_mode = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -828,7 +831,7 @@ class TaskbarCompanionBar(QWidget):
         self.reanchor()
 
     def rebuild_sensors(self, active_keys):
-        self.active_keys = list(active_keys)
+        self.active_keys = [k for k in active_keys if k in SENSOR_METADATA]
 
         while self.layout_main.count():
             child = self.layout_main.takeAt(0)
@@ -836,16 +839,27 @@ class TaskbarCompanionBar(QWidget):
                 child.widget().deleteLater()
 
         self.labels.clear()
-        for key in self.active_keys:
-            if key not in SENSOR_METADATA:
-                continue
+        visible_keys = self._compute_visible_keys()
+        self.hidden_count = max(0, len(self.active_keys) - len(visible_keys))
+
+        for key in visible_keys:
             label = QLabel(f"{SENSOR_METADATA[key]['short']}: --")
             label.setObjectName("CompanionMetric")
             self.layout_main.addWidget(label)
             self.labels[key] = label
 
+        if self.hidden_count > 0:
+            more = QLabel(f"+{self.hidden_count}")
+            more.setObjectName("CompanionMetric")
+            more.setToolTip("Additional sensors are hidden due to limited taskbar space")
+            self.layout_main.addWidget(more)
+
         self.layout_main.addStretch()
         self._resize_to_content()
+
+    def set_compact_mode(self, enabled):
+        self.compact_three_mode = bool(enabled)
+        self.rebuild_sensors(self.active_keys)
 
     def update_metrics(self, values, freshness):
         for key, label in self.labels.items():
@@ -869,10 +883,42 @@ class TaskbarCompanionBar(QWidget):
 
     def _resize_to_content(self):
         self.container.adjustSize()
-        width = max(220, self.container.sizeHint().width())
+        width_limit = self._get_width_limit()
+        width = max(220, min(self.container.sizeHint().width(), width_limit))
         height = max(32, self.container.sizeHint().height())
         self.setFixedSize(width, height)
         self.container.setFixedSize(width, height)
+
+    def _get_width_limit(self):
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 520
+        avail = screen.availableGeometry().width()
+        return max(240, min(560, int(avail * 0.45)))
+
+    def _compute_visible_keys(self):
+        if self.compact_three_mode:
+            return self.active_keys[:3]
+
+        width_limit = self._get_width_limit()
+        self._last_layout_limit = width_limit
+
+        # Approximate per-metric width budget in this compact bar.
+        slot_width = 92
+        base_padding = 24
+        capacity = max(1, int((width_limit - base_padding) / slot_width))
+
+        if len(self.active_keys) <= capacity:
+            return self.active_keys
+
+        # Reserve one slot for +N overflow indicator when truncated.
+        visible_capacity = max(1, capacity - 1)
+        return self.active_keys[:visible_capacity]
+
+    def _refresh_layout_if_needed(self):
+        current_limit = self._get_width_limit()
+        if self._last_layout_limit is None or abs(current_limit - self._last_layout_limit) >= 20:
+            self.rebuild_sensors(self.active_keys)
 
     def _show_context_menu(self, _pos):
         self.menu.exec(QCursor.pos())
@@ -885,6 +931,7 @@ class TaskbarCompanionBar(QWidget):
         super().mousePressEvent(event)
 
     def reanchor(self):
+        self._refresh_layout_if_needed()
         x, y = self.anchor.get_widget_position(self.width(), self.height(), margin=8)
         self.move(x, y)
 
@@ -910,6 +957,8 @@ class MeterTray(QObject):
         
         self.flyout = FlyoutPanel(self.open_config_dialog, self.quit_app)
         self.companion_bar = TaskbarCompanionBar(self.menu, self.toggle_flyout)
+        self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
+        self.apply_companion_visibility()
 
         # Keep expensive temperature probes off the UI polling path.
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -971,6 +1020,16 @@ class MeterTray(QObject):
         self.startup_action.setChecked(self.cfg.get("launch_on_startup", True))
         self.startup_action.triggered.connect(self.on_startup_toggled)
         self.menu.addAction(self.startup_action)
+
+        self.companion_action = QAction("Show Taskbar Companion Bar", self, checkable=True)
+        self.companion_action.setChecked(self.cfg.get("show_companion_bar", True))
+        self.companion_action.triggered.connect(self.on_companion_bar_toggled)
+        self.menu.addAction(self.companion_action)
+
+        self.companion_compact_action = QAction("Companion Compact Mode (3 Metrics)", self, checkable=True)
+        self.companion_compact_action.setChecked(self.cfg.get("companion_compact_mode", False))
+        self.companion_compact_action.triggered.connect(self.on_companion_compact_toggled)
+        self.menu.addAction(self.companion_compact_action)
         
         self.menu.addSeparator()
         
@@ -997,6 +1056,26 @@ class MeterTray(QObject):
         self.cfg["launch_on_startup"] = self.startup_action.isChecked()
         config.save_config(self.cfg)
         self.update_startup_registry()
+
+    def on_companion_bar_toggled(self):
+        self.cfg["show_companion_bar"] = self.companion_action.isChecked()
+        config.save_config(self.cfg)
+        self.apply_companion_visibility()
+
+    def on_companion_compact_toggled(self):
+        enabled = self.companion_compact_action.isChecked()
+        self.cfg["companion_compact_mode"] = enabled
+        config.save_config(self.cfg)
+        self.companion_bar.set_compact_mode(enabled)
+        self.poll_metrics()
+
+    def apply_companion_visibility(self):
+        should_show = self.cfg.get("show_companion_bar", True)
+        if should_show:
+            self.companion_bar.show()
+            self.companion_bar.reanchor()
+        else:
+            self.companion_bar.hide()
         
     def update_startup_registry(self):
         try:
@@ -1025,8 +1104,14 @@ class MeterTray(QObject):
         
     def on_config_saved(self):
         self.cfg = config.load_config()
+        self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
         self.flyout.rebuild_cards()
         self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
+        if hasattr(self, "companion_action"):
+            self.companion_action.setChecked(self.cfg.get("show_companion_bar", True))
+        if hasattr(self, "companion_compact_action"):
+            self.companion_compact_action.setChecked(self.cfg.get("companion_compact_mode", False))
+        self.apply_companion_visibility()
         self.rebuild_tray_icons()
         self.poll_metrics()
         

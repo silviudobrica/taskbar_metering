@@ -8,7 +8,9 @@ DEFAULT_CONFIG = {
     ],
     "poll_rate": 5,  # in seconds
     "installed": False,
-    "launch_on_startup": True
+    "launch_on_startup": True,
+    "show_companion_bar": True,
+    "companion_compact_mode": False
 }
 
 APP_IPC_SERVER_NAME = "TaskbarMeteringIPC"
