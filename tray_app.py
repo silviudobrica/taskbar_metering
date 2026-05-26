@@ -1,12 +1,14 @@
 import sys
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QWidget, 
                              QLabel, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QDialog, QAbstractItemView,
                              QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea)
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
                            QAction, QActionGroup, QCursor, QPainterPath)
-from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject
+from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject, QSharedMemory
 
 import config
 import metrics
@@ -659,6 +661,17 @@ class MeterTray(QObject):
         self.setup_menu()
         
         self.flyout = FlyoutPanel(self.open_config_dialog, self.quit_app)
+
+        # Keep expensive temperature probes off the UI polling path.
+        self._executor = ThreadPoolExecutor(max_workers=2)
+        self._cpu_temp_future = None
+        self._cpu_temp_cache = None
+        self._cpu_temp_last_request = 0.0
+        self._cpu_temp_min_interval = 10.0
+        self._disk_temp_futures = {}
+        self._disk_temp_cache = {}
+        self._disk_temp_last_request = {}
+        self._disk_temp_min_interval = 20.0
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_metrics)
@@ -801,8 +814,9 @@ class MeterTray(QObject):
             self.tray_icons.append((key, tray_icon))
             
     def poll_metrics(self):
+        now = time.monotonic()
         cpu_usage = metrics.get_cpu_usage()
-        cpu_temp = metrics.get_cpu_temp()
+        cpu_temp = self._get_cpu_temp_cached(now)
         ram_usage = metrics.get_ram_usage()
         gpu_usage, gpu_temp = metrics.get_gpu_metrics()
         disk_usage_list = metrics.get_disk_usage()
@@ -824,7 +838,7 @@ class MeterTray(QObject):
             values[usage_key] = d["percent"]
             
             temp_key = f"disk_temp_{dev_clean}"
-            values[temp_key] = metrics.get_drive_temp(dev_name)
+            values[temp_key] = self._get_drive_temp_cached(dev_name, now)
         
         self.flyout.update_metrics(values)
         
@@ -905,11 +919,42 @@ class MeterTray(QObject):
             self.uninstall_callback()
         else:
             self.quit_app()
+
+    def _get_cpu_temp_cached(self, now):
+        if self._cpu_temp_future and self._cpu_temp_future.done():
+            try:
+                self._cpu_temp_cache = self._cpu_temp_future.result()
+            except Exception:
+                pass
+            self._cpu_temp_future = None
+
+        if self._cpu_temp_future is None and (now - self._cpu_temp_last_request) >= self._cpu_temp_min_interval:
+            self._cpu_temp_last_request = now
+            self._cpu_temp_future = self._executor.submit(metrics.get_cpu_temp)
+
+        return self._cpu_temp_cache
+
+    def _get_drive_temp_cached(self, drive_letter, now):
+        future = self._disk_temp_futures.get(drive_letter)
+        if future and future.done():
+            try:
+                self._disk_temp_cache[drive_letter] = future.result()
+            except Exception:
+                pass
+            self._disk_temp_futures.pop(drive_letter, None)
+
+        last_req = self._disk_temp_last_request.get(drive_letter, 0.0)
+        if drive_letter not in self._disk_temp_futures and (now - last_req) >= self._disk_temp_min_interval:
+            self._disk_temp_last_request[drive_letter] = now
+            self._disk_temp_futures[drive_letter] = self._executor.submit(metrics.get_drive_temp, drive_letter)
+
+        return self._disk_temp_cache.get(drive_letter)
             
     def quit_app(self):
         for _, icon in self.tray_icons:
             icon.hide()
         self.flyout.hide()
+        self._executor.shutdown(wait=False)
         metrics.cleanup_metrics()
         QApplication.quit()
 
@@ -918,5 +963,11 @@ def run_app(uninstall_callback=None):
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    singleton = QSharedMemory("TaskbarMeteringSingleton")
+    if not singleton.create(1):
+        return
+    app.singleton_lock = singleton
+
     app.tray_ref = MeterTray(uninstall_callback)
     sys.exit(app.exec())
