@@ -16,7 +16,7 @@ import config
 
 def _is_running_inside_app_process():
     app = QApplication.instance()
-    return bool(app and hasattr(app, "tray_ref"))
+    return bool(app and (hasattr(app, "tray_ref") or hasattr(app, "tray_instance")))
 
 
 def request_running_instance_exit(wait_seconds=8):

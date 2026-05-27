@@ -957,6 +957,7 @@ class MeterTray(QObject):
         
         self.flyout = FlyoutPanel(self.open_config_dialog, self.quit_app)
         self.companion_bar = TaskbarCompanionBar(self.menu, self.toggle_flyout)
+        self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
         self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
         self.apply_companion_visibility()
 
