@@ -790,7 +790,10 @@ class FlyoutPanel(QWidget):
         self.cfg = config.load_config()
         
         font_size = self.cfg.get("tray_icon_font_size", 10)
-        gauge_font_size = min(20, max(8, int(font_size)))
+        # Keep dashboard gauges and text readable even when tray icon size is small.
+        gauge_font_size = min(20, max(12, int(font_size)))
+        gauge_size = 48 + max(0, (gauge_font_size - 10) * 3)
+        card_height = max(88, gauge_size + 24)
         
         for key in self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]):
             if key not in SENSOR_METADATA:
@@ -806,14 +809,15 @@ class FlyoutPanel(QWidget):
                 }
             """)
             card_layout = QHBoxLayout(card_widget)
-            card_layout.setContentsMargins(10, 8, 10, 8)
+            card_layout.setContentsMargins(12, 10, 12, 10)
             card_layout.setSpacing(12)
+            card_widget.setFixedHeight(card_height)
             
             progress = CircularProgress(meta["color"], font_size=gauge_font_size, parent=card_widget)
             card_layout.addWidget(progress)
             
             text_layout = QVBoxLayout()
-            text_layout.setSpacing(2)
+            text_layout.setSpacing(4)
             text_layout.setContentsMargins(0, 2, 0, 2)
             lbl = QLabel(meta["label"])
             lbl.setObjectName("MetricLabel")
@@ -840,11 +844,10 @@ class FlyoutPanel(QWidget):
             }
             
         item_count = len(self.cards)
-        gauge_size = 48 + max(0, (gauge_font_size - 10) * 3)
-        item_height = max(72, gauge_size + 18)
-        dyn_height = 80 + (item_count * item_height)
-        dashboard_width = min(520, max(320, gauge_size + 250))
-        self.setFixedSize(dashboard_width, min(max(dyn_height, 150), 600))
+        item_height = card_height
+        dyn_height = 170 + (item_count * item_height)
+        dashboard_width = min(520, max(360, gauge_size + 250))
+        self.setFixedSize(dashboard_width, min(max(dyn_height, 300), 680))
         self.main_container.setFixedSize(self.width(), self.height())
         
     def update_metrics(self, values, freshness=None):
@@ -1261,10 +1264,7 @@ class MeterTray(QObject):
     def on_tray_icon_size_changed(self):
         sender = self.sender()
         if sender:
-            size = int(sender.data())
-            self.cfg["tray_icon_font_size"] = size
-            config.save_config(self.cfg)
-            self.poll_metrics()
+            self._set_tray_icon_size(int(sender.data()))
 
     def increase_tray_icon_size(self):
         self._set_tray_icon_size(self.cfg.get("tray_icon_font_size", 10) + 1)
@@ -1280,9 +1280,18 @@ class MeterTray(QObject):
         for act in self.icon_size_group.actions():
             act.setChecked(int(act.data()) == clamped)
 
-        # Update gauge sizes immediately
-        for card_info in self.flyout.cards.values():
-            card_info["progress_widget"].set_font_size(clamped)
+        # Rebuild flyout cards so both gauge geometry and panel size are recalculated.
+        was_visible = self.flyout.isVisible()
+        if was_visible:
+            # Hide briefly to force a clean Qt layout recalculation on resize down
+            self.flyout.hide()
+
+        self.flyout.rebuild_cards()
+        
+        if was_visible:
+            self.flyout.position_above_clock()
+            self.flyout.show()
+            self.flyout.activateWindow()
 
         self.poll_metrics()
 
@@ -1482,6 +1491,7 @@ class MeterTray(QObject):
             
     def create_sensor_icon(self, key, val):
         base_font_size = int(self.cfg.get("tray_icon_font_size", 10))
+        base_font_size = max(8, min(24, base_font_size))
 
         # Windows notification area downscales aggressively; keeping 32px yields crisper numerals.
         icon_size = 32
@@ -1494,10 +1504,13 @@ class MeterTray(QObject):
         meta = SENSOR_METADATA[key]
         color = QColor(meta["color"])
 
-        pad = 3
+        # Scale visual weight within fixed 32x32 tray slot.
+        scale = (base_font_size - 8) / 16.0
+        pad = max(1, 4 - int(scale * 3))
         diameter = icon_size - (2 * pad)
-        pen_w = 2.6
-        text_rect = pixmap.rect().adjusted(7, 7, -7, -7)
+        pen_w = 2.0 + (scale * 1.2)
+        text_inset = max(2, 8 - int(scale * 6))
+        text_rect = pixmap.rect().adjusted(text_inset, text_inset, -text_inset, -text_inset)
 
         def fit_font(text, preferred_size, min_size=7):
             size = max(min_size, int(preferred_size))
@@ -1529,7 +1542,7 @@ class MeterTray(QObject):
             painter.setPen(QColor("#FFFFFF"))
             val_rounded = int(round(val))
             val_str = f"{val_rounded}"
-            preferred = min(18, max(10, base_font_size + 2))
+            preferred = min(28, max(10, base_font_size + 5))
             if len(val_str) >= 3:
                 preferred -= 2
             font = fit_font(val_str, preferred)
