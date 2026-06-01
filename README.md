@@ -19,6 +19,10 @@ A lightweight Windows system-tray application that renders real-time hardware me
   - Per-disk Temperature (°C) — via PowerShell Storage API
 - **Sensor configuration dialog** — toggle sensors on/off and reorder them with arrow buttons; order is reflected left-to-right on the tray icon
 - **Configurable poll rate** — default 5 seconds, stored in `config.json`
+- **Adjustable tray icon number size** — set from the tray icon right-click menu to improve readability on different displays/taskbar sizes
+- **Quick size controls** — right-click actions for fast `+ / -` tray number and companion text scaling
+- **Keyboard resizing shortcuts** (when dashboard is focused): `Ctrl + +/-` for tray icon numbers, `Ctrl + Shift + +/-` for companion text
+- **On-panel shortcut hint** — the dashboard shows a compact legend for the resizing shortcuts
 - **Launch on Windows startup** — optional registry entry created during installation
 - **Standalone mode** — run without installing (no registry entry, no file copy)
 - **Graceful uninstall** — removes copied files, startup registry entry, and config directory via IPC shutdown
@@ -87,7 +91,7 @@ python main.py --uninstall
 
 ## Building a Standalone Executable
 
-A PyInstaller spec file is included. Run the helper script to produce a single-file executable in `dist/`:
+Run the helper script to produce a single-file executable in `dist/`:
 
 ```powershell
 .\build.bat
@@ -95,7 +99,7 @@ A PyInstaller spec file is included. Run the helper script to produce a single-f
 
 This script:
 1. Cleans previous `build/` and `dist/` directories
-2. Runs PyInstaller using `taskbar_meter.spec`
+2. Runs PyInstaller using `taskbar_meter.spec` when present, otherwise falls back to building from `main.py`
 3. Outputs `dist\taskbar_meter.exe`
 
 > Requires PyInstaller: `pip install pyinstaller`
@@ -128,6 +132,8 @@ Settings are stored in `%LOCALAPPDATA%\TaskbarMetering\config.json`.
 | `launch_on_startup` | `true` | Whether a Windows startup entry exists |
 | `show_companion_bar` | `true` | Show the anchored companion bar |
 | `companion_compact_mode` | `false` | Use compact layout for the companion bar |
+| `tray_icon_font_size` | `10` | Font size (pt) for numeric values rendered inside each tray icon (8-24) |
+| `companion_font_size` | `11` | Font size (pt) for the text shown in the companion bar |
 
 You can edit this file manually or use the **Settings** dialog accessible from the tray icon right-click menu.
 
@@ -156,7 +162,7 @@ taskbar_metering/
 ├── metrics.py           # Hardware metric collectors (CPU, RAM, GPU, disk)
 ├── config.py            # Config load/save, default values, AppData paths
 ├── installer.py         # Installation wizard UI and uninstall logic
-├── taskbar_meter.spec   # PyInstaller build spec
+├── taskbar_meter.spec   # Optional PyInstaller build spec
 ├── build.bat            # Helper script to invoke PyInstaller
 └── LICENSE              # Apache License 2.0
 ```

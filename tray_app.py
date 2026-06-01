@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QWidget,
                              QListWidget, QListWidgetItem, QDialog, QAbstractItemView,
                              QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea)
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
-                           QAction, QActionGroup, QCursor, QPainterPath, QGuiApplication)
+                           QAction, QActionGroup, QCursor, QPainterPath, QGuiApplication,
+                           QShortcut, QKeySequence)
 from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject, QSharedMemory
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -182,6 +183,80 @@ class TaskbarAnchor:
             pass
         return None
 
+    def _window_rect(self, hwnd):
+        if not hwnd:
+            return None
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return rect
+        return None
+
+    def _collect_taskbar_rects(self):
+        """Collect primary and secondary taskbar rectangles on Windows."""
+        rects = []
+        if os.name != "nt":
+            return rects
+
+        try:
+            user32 = ctypes.windll.user32
+
+            primary = user32.FindWindowW("Shell_TrayWnd", None)
+            primary_rect = self._window_rect(primary)
+            if primary_rect:
+                rects.append(primary_rect)
+
+            after = 0
+            while True:
+                hwnd = user32.FindWindowExW(0, after, "Shell_SecondaryTrayWnd", None)
+                if not hwnd:
+                    break
+                rect = self._window_rect(hwnd)
+                if rect:
+                    rects.append(rect)
+                after = hwnd
+        except Exception:
+            pass
+
+        # Fallback for cases where secondary taskbars are not exposed by class.
+        if not rects:
+            fallback = self._taskbar_rect()
+            if fallback:
+                rects.append(fallback)
+
+        return rects
+
+    def _intersection_area(self, a, b):
+        left = max(int(a.left), int(b.left()))
+        top = max(int(a.top), int(b.top()))
+        right = min(int(a.right), int(b.right()))
+        bottom = min(int(a.bottom), int(b.bottom()))
+        if right <= left or bottom <= top:
+            return 0
+        return (right - left) * (bottom - top)
+
+    def _taskbar_rect_for_screen(self, screen):
+        if screen is None:
+            return self._taskbar_rect()
+
+        rects = self._collect_taskbar_rects()
+        if not rects:
+            return None
+
+        geom = screen.geometry()
+        best_rect = None
+        best_area = 0
+        for rect in rects:
+            area = self._intersection_area(rect, geom)
+            if area > best_area:
+                best_area = area
+                best_rect = rect
+
+        if best_rect is not None:
+            return best_rect
+
+        # Fallback to any known taskbar if there was no overlap.
+        return rects[0]
+
     def get_widget_position(self, width, height, margin=10):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         if screen is None:
@@ -192,7 +267,7 @@ class TaskbarAnchor:
         x = avail.right() - width - margin
         y = avail.bottom() - height - margin
 
-        taskbar = self._taskbar_rect()
+        taskbar = self._taskbar_rect_for_screen(screen)
         if taskbar is not None:
             t_left = int(taskbar.left)
             t_top = int(taskbar.top)
@@ -223,13 +298,26 @@ class TaskbarAnchor:
 
 class CircularProgress(QWidget):
     """Custom premium widget representing a circular metric meter in the flyout"""
-    def __init__(self, color_hex, parent=None):
+    def __init__(self, color_hex, font_size=10, parent=None):
         super().__init__(parent)
         self.color = QColor(color_hex)
         self.value = 0.0
         self.max_val = 100
         self.unit = "%"
-        self.setFixedSize(50, 50)
+        self.font_size = max(8, min(24, int(font_size)))
+        self.update_size()
+
+    def update_size(self):
+        # Scale widget size based on font_size: 50px baseline at font 10, up to 80px at font 24
+        size = 50 + max(0, (self.font_size - 10) * 2)
+        self.setFixedSize(size, size)
+        self.update()
+
+    def set_font_size(self, font_size):
+        new_size = max(8, min(24, int(font_size)))
+        if new_size != self.font_size:
+            self.font_size = new_size
+            self.update_size()
         
     def set_value(self, val, max_val=100, unit="%"):
         self.value = val
@@ -240,20 +328,37 @@ class CircularProgress(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        def fit_font(text, preferred_size, min_size=7):
+            target = self.rect().adjusted(10, 10, -10, -10)
+            size = max(min_size, int(preferred_size))
+            while size >= min_size:
+                font = QFont("Segoe UI", size, QFont.Bold)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                if metrics.horizontalAdvance(text) <= target.width() and metrics.height() <= target.height():
+                    return font
+                size -= 1
+            return QFont("Segoe UI", min_size, QFont.Bold)
+        
+        size = self.width()
+        pad = max(3, int(size * 0.06))
+        diameter = size - (2 * pad)
+        pen_w = max(2.5, size * 0.07)
         
         # Background arc
-        bg_pen = QPen(QColor(42, 42, 48), 3.5)
+        bg_pen = QPen(QColor(42, 42, 48), pen_w)
         painter.setPen(bg_pen)
-        painter.drawEllipse(3, 3, 44, 44)
+        painter.drawEllipse(pad, pad, diameter, diameter)
         
         if self.value is None:
             # Draw dotted gray circle for unsupported
-            dot_pen = QPen(QColor(90, 90, 95), 3, Qt.DashLine)
+            dot_pen = QPen(QColor(90, 90, 95), pen_w, Qt.DashLine)
             painter.setPen(dot_pen)
-            painter.drawEllipse(3, 3, 44, 44)
+            painter.drawEllipse(pad, pad, diameter, diameter)
             
             painter.setPen(QColor("#78909C"))
-            font = QFont("Segoe UI", 9, QFont.Bold)
+            font = fit_font("--", max(7, self.font_size - 1))
             painter.setFont(font)
             painter.drawText(self.rect(), Qt.AlignCenter, "--")
         else:
@@ -261,15 +366,15 @@ class CircularProgress(QWidget):
             ratio = percent / self.max_val
             span = -int(ratio * 360 * 16)
             
-            fg_pen = QPen(self.color, 3.5)
+            fg_pen = QPen(self.color, pen_w)
             painter.setPen(fg_pen)
-            painter.drawArc(3, 3, 44, 44, 90 * 16, span)
+            painter.drawArc(pad, pad, diameter, diameter, 90 * 16, span)
             
             # Value in center
             painter.setPen(QColor("#FFFFFF"))
-            font = QFont("Segoe UI", 10, QFont.Bold)
-            painter.setFont(font)
             val_str = f"{int(round(self.value))}"
+            preferred = self.font_size - 1 if len(val_str) >= 3 else self.font_size
+            painter.setFont(fit_font(val_str, preferred))
             painter.drawText(self.rect(), Qt.AlignCenter, val_str)
         painter.end()
 
@@ -591,6 +696,10 @@ class FlyoutPanel(QWidget):
                 font-size: 10px;
                 color: #607D8B;
             }
+            QLabel#Hint {
+                font-size: 10px;
+                color: #78909C;
+            }
             QPushButton#IconBtn {
                 background-color: transparent;
                 border: none;
@@ -646,6 +755,14 @@ class FlyoutPanel(QWidget):
         self.list_layout = QVBoxLayout()
         self.list_layout.setSpacing(8)
         layout.addLayout(self.list_layout)
+
+        self.shortcut_hint = QLabel(
+            "Shortcuts: Ctrl +/- tray size, Ctrl+Shift +/- companion size",
+            self
+        )
+        self.shortcut_hint.setObjectName("Hint")
+        self.shortcut_hint.setWordWrap(True)
+        layout.addWidget(self.shortcut_hint)
         
         layout.addStretch()
         
@@ -687,7 +804,7 @@ class FlyoutPanel(QWidget):
             card_layout.setContentsMargins(10, 8, 10, 8)
             card_layout.setSpacing(12)
             
-            progress = CircularProgress(meta["color"], card_widget)
+            progress = CircularProgress(meta["color"], font_size=font_size, parent=card_widget)
             card_layout.addWidget(progress)
             
             text_layout = QVBoxLayout()
@@ -784,7 +901,7 @@ class FlyoutPanel(QWidget):
 
 class TaskbarCompanionBar(QWidget):
     """Compact always-on bar anchored near the clock with live metric text."""
-    def __init__(self, menu, toggle_flyout_callback, parent=None):
+    def __init__(self, menu, toggle_flyout_callback, text_size=11, parent=None):
         super().__init__(parent)
         self.menu = menu
         self.toggle_flyout_callback = toggle_flyout_callback
@@ -794,6 +911,7 @@ class TaskbarCompanionBar(QWidget):
         self.hidden_count = 0
         self._last_layout_limit = None
         self.compact_three_mode = False
+        self.text_size = max(8, min(18, int(text_size)))
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -810,7 +928,6 @@ class TaskbarCompanionBar(QWidget):
             }
             QLabel#CompanionMetric {
                 color: #ECEFF1;
-                font-size: 11px;
                 font-weight: bold;
                 padding: 0 2px;
             }
@@ -845,12 +962,14 @@ class TaskbarCompanionBar(QWidget):
         for key in visible_keys:
             label = QLabel(f"{SENSOR_METADATA[key]['short']}: --")
             label.setObjectName("CompanionMetric")
+            label.setFont(QFont("Segoe UI", self.text_size, QFont.Bold))
             self.layout_main.addWidget(label)
             self.labels[key] = label
 
         if self.hidden_count > 0:
             more = QLabel(f"+{self.hidden_count}")
             more.setObjectName("CompanionMetric")
+            more.setFont(QFont("Segoe UI", self.text_size, QFont.Bold))
             more.setToolTip("Additional sensors are hidden due to limited taskbar space")
             self.layout_main.addWidget(more)
 
@@ -860,6 +979,12 @@ class TaskbarCompanionBar(QWidget):
     def set_compact_mode(self, enabled):
         self.compact_three_mode = bool(enabled)
         self.rebuild_sensors(self.active_keys)
+
+    def set_text_size(self, size):
+        clamped = max(8, min(18, int(size)))
+        if clamped != self.text_size:
+            self.text_size = clamped
+            self.rebuild_sensors(self.active_keys)
 
     def update_metrics(self, values, freshness):
         for key, label in self.labels.items():
@@ -956,7 +1081,12 @@ class MeterTray(QObject):
         self.setup_ipc_server()
         
         self.flyout = FlyoutPanel(self.open_config_dialog, self.quit_app)
-        self.companion_bar = TaskbarCompanionBar(self.menu, self.toggle_flyout)
+        self.companion_bar = TaskbarCompanionBar(
+            self.menu,
+            self.toggle_flyout,
+            text_size=self.cfg.get("companion_font_size", 11)
+        )
+        self._setup_flyout_shortcuts()
         self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
         self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
         self.apply_companion_visibility()
@@ -1016,6 +1146,40 @@ class MeterTray(QObject):
             self.poll_group.addAction(act)
             self.poll_menu.addAction(act)
         self.menu.addMenu(self.poll_menu)
+
+        self.icon_size_menu = QMenu("Tray Icon Number Size", self.menu)
+        self.icon_size_group = QActionGroup(self)
+        for size in (8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24):
+            act = QAction(f"{size} pt", self, checkable=True)
+            act.setChecked(self.cfg.get("tray_icon_font_size", 10) == size)
+            act.setData(size)
+            act.triggered.connect(self.on_tray_icon_size_changed)
+            self.icon_size_group.addAction(act)
+            self.icon_size_menu.addAction(act)
+        tray_size_up = QAction("Increase Tray Number Size (+)", self)
+        tray_size_up.triggered.connect(self.increase_tray_icon_size)
+        tray_size_down = QAction("Decrease Tray Number Size (-)", self)
+        tray_size_down.triggered.connect(self.decrease_tray_icon_size)
+        self.menu.addAction(tray_size_up)
+        self.menu.addAction(tray_size_down)
+        self.menu.addMenu(self.icon_size_menu)
+
+        self.companion_font_menu = QMenu("Companion Text Size", self.menu)
+        self.companion_font_group = QActionGroup(self)
+        for size in (9, 10, 11, 12, 13, 14, 15, 16):
+            act = QAction(f"{size} pt", self, checkable=True)
+            act.setChecked(self.cfg.get("companion_font_size", 11) == size)
+            act.setData(size)
+            act.triggered.connect(self.on_companion_text_size_changed)
+            self.companion_font_group.addAction(act)
+            self.companion_font_menu.addAction(act)
+        comp_size_up = QAction("Increase Companion Text Size (+)", self)
+        comp_size_up.triggered.connect(self.increase_companion_text_size)
+        comp_size_down = QAction("Decrease Companion Text Size (-)", self)
+        comp_size_down.triggered.connect(self.decrease_companion_text_size)
+        self.menu.addAction(comp_size_up)
+        self.menu.addAction(comp_size_down)
+        self.menu.addMenu(self.companion_font_menu)
         
         self.startup_action = QAction("Launch on Startup", self, checkable=True)
         self.startup_action.setChecked(self.cfg.get("launch_on_startup", True))
@@ -1041,6 +1205,35 @@ class MeterTray(QObject):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.quit_app)
         self.menu.addAction(exit_action)
+
+    def _setup_flyout_shortcuts(self):
+        # Shortcuts are active only while the dashboard (flyout) has focus.
+        self._flyout_shortcuts = []
+
+        tray_inc_keys = ["Ctrl++", "Ctrl+="]
+        tray_dec_keys = ["Ctrl+-", "Ctrl+_"]
+        companion_inc_keys = ["Ctrl+Shift++", "Ctrl+Shift+="]
+        companion_dec_keys = ["Ctrl+Shift+-", "Ctrl+Shift+_"]
+
+        for seq in tray_inc_keys:
+            shortcut = QShortcut(QKeySequence(seq), self.flyout)
+            shortcut.activated.connect(self.increase_tray_icon_size)
+            self._flyout_shortcuts.append(shortcut)
+
+        for seq in tray_dec_keys:
+            shortcut = QShortcut(QKeySequence(seq), self.flyout)
+            shortcut.activated.connect(self.decrease_tray_icon_size)
+            self._flyout_shortcuts.append(shortcut)
+
+        for seq in companion_inc_keys:
+            shortcut = QShortcut(QKeySequence(seq), self.flyout)
+            shortcut.activated.connect(self.increase_companion_text_size)
+            self._flyout_shortcuts.append(shortcut)
+
+        for seq in companion_dec_keys:
+            shortcut = QShortcut(QKeySequence(seq), self.flyout)
+            shortcut.activated.connect(self.decrease_companion_text_size)
+            self._flyout_shortcuts.append(shortcut)
         
     def update_timer_interval(self):
         self.timer.setInterval(self.cfg["poll_rate"] * 1000)
@@ -1052,6 +1245,56 @@ class MeterTray(QObject):
             self.cfg["poll_rate"] = sec
             config.save_config(self.cfg)
             self.update_timer_interval()
+
+    def on_tray_icon_size_changed(self):
+        sender = self.sender()
+        if sender:
+            size = int(sender.data())
+            self.cfg["tray_icon_font_size"] = size
+            config.save_config(self.cfg)
+            self.poll_metrics()
+
+    def increase_tray_icon_size(self):
+        self._set_tray_icon_size(self.cfg.get("tray_icon_font_size", 10) + 1)
+
+    def decrease_tray_icon_size(self):
+        self._set_tray_icon_size(self.cfg.get("tray_icon_font_size", 10) - 1)
+
+    def _set_tray_icon_size(self, size):
+        clamped = max(8, min(24, int(size)))
+        self.cfg["tray_icon_font_size"] = clamped
+        config.save_config(self.cfg)
+
+        for act in self.icon_size_group.actions():
+            act.setChecked(int(act.data()) == clamped)
+
+        # Update gauge sizes immediately
+        for card_info in self.flyout.cards.values():
+            card_info["progress_widget"].set_font_size(clamped)
+
+        self.poll_metrics()
+
+    def on_companion_text_size_changed(self):
+        sender = self.sender()
+        if sender:
+            self._set_companion_text_size(int(sender.data()))
+
+    def increase_companion_text_size(self):
+        self._set_companion_text_size(self.cfg.get("companion_font_size", 11) + 1)
+
+    def decrease_companion_text_size(self):
+        self._set_companion_text_size(self.cfg.get("companion_font_size", 11) - 1)
+
+    def _set_companion_text_size(self, size):
+        clamped = max(8, min(18, int(size)))
+        self.cfg["companion_font_size"] = clamped
+        config.save_config(self.cfg)
+
+        for act in self.companion_font_group.actions():
+            act.setChecked(int(act.data()) == clamped)
+
+        self.companion_bar.set_text_size(clamped)
+        self.companion_bar.reanchor()
             
     def on_startup_toggled(self):
         self.cfg["launch_on_startup"] = self.startup_action.isChecked()
@@ -1106,12 +1349,23 @@ class MeterTray(QObject):
     def on_config_saved(self):
         self.cfg = config.load_config()
         self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
+        self.companion_bar.set_text_size(self.cfg.get("companion_font_size", 11))
         self.flyout.rebuild_cards()
         self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
+        # Also update gauge sizes in existing cards
+        font_size = self.cfg.get("tray_icon_font_size", 10)
+        for card_info in self.flyout.cards.values():
+            card_info["progress_widget"].set_font_size(font_size)
         if hasattr(self, "companion_action"):
             self.companion_action.setChecked(self.cfg.get("show_companion_bar", True))
         if hasattr(self, "companion_compact_action"):
             self.companion_compact_action.setChecked(self.cfg.get("companion_compact_mode", False))
+        if hasattr(self, "icon_size_group"):
+            for act in self.icon_size_group.actions():
+                act.setChecked(int(act.data()) == int(self.cfg.get("tray_icon_font_size", 10)))
+        if hasattr(self, "companion_font_group"):
+            for act in self.companion_font_group.actions():
+                act.setChecked(int(act.data()) == int(self.cfg.get("companion_font_size", 11)))
         self.apply_companion_visibility()
         self.rebuild_tray_icons()
         self.poll_metrics()
@@ -1215,7 +1469,11 @@ class MeterTray(QObject):
             tray_icon.setToolTip(f"Taskbar Metering\n{tooltip}")
             
     def create_sensor_icon(self, key, val):
-        pixmap = QPixmap(32, 32)
+        base_font_size = int(self.cfg.get("tray_icon_font_size", 10))
+
+        # Keep 32px default while allowing higher-size custom text to render in larger icon variants.
+        icon_size = 32 if base_font_size <= 14 else min(64, 32 + (base_font_size - 14) * 3)
+        pixmap = QPixmap(icon_size, icon_size)
         pixmap.fill(Qt.transparent)
         
         painter = QPainter(pixmap)
@@ -1223,11 +1481,27 @@ class MeterTray(QObject):
         
         meta = SENSOR_METADATA[key]
         color = QColor(meta["color"])
+
+        pad = max(4, int(icon_size * 0.13))
+        diameter = icon_size - (2 * pad)
+        pen_w = max(2.2, icon_size * 0.085)
+        text_rect = pixmap.rect().adjusted(pad + 1, pad + 1, -(pad + 1), -(pad + 1))
+
+        def fit_font(text, preferred_size, min_size=7):
+            size = max(min_size, int(preferred_size))
+            while size >= min_size:
+                font = QFont("Segoe UI", size, QFont.Bold)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                if metrics.horizontalAdvance(text) <= text_rect.width() and metrics.height() <= text_rect.height():
+                    return font
+                size -= 1
+            return QFont("Segoe UI", min_size, QFont.Bold)
         
         # 1. Background dark ring
-        bg_pen = QPen(QColor(50, 50, 55, 140), 2.5)
+        bg_pen = QPen(QColor(50, 50, 55, 140), pen_w)
         painter.setPen(bg_pen)
-        painter.drawEllipse(4, 4, 24, 24)
+        painter.drawEllipse(pad, pad, diameter, diameter)
         
         # 2. Foreground active colored arc
         if val is not None:
@@ -1235,31 +1509,29 @@ class MeterTray(QObject):
             ratio = percent / meta["max"]
             span = -int(ratio * 360 * 16)
             
-            fg_pen = QPen(color, 2.5)
+            fg_pen = QPen(color, pen_w)
             painter.setPen(fg_pen)
-            painter.drawArc(4, 4, 24, 24, 90 * 16, span)
+            painter.drawArc(pad, pad, diameter, diameter, 90 * 16, span)
             
             # 3. Numeric text in center
             painter.setPen(QColor("#FFFFFF"))
             val_rounded = int(round(val))
-            if val_rounded >= 100:
-                font = QFont("Segoe UI", 8, QFont.Bold)
-            else:
-                font = QFont("Segoe UI", 9, QFont.Bold)
+            val_str = f"{val_rounded}"
+            preferred = base_font_size - 1 if len(val_str) >= 3 else base_font_size
+            font = fit_font(val_str, preferred)
             painter.setFont(font)
             
-            val_str = f"{val_rounded}"
-            painter.drawText(pixmap.rect(), Qt.AlignCenter, val_str)
+            painter.drawText(text_rect, Qt.AlignCenter, val_str)
         else:
             # Unsupported/N/A dotted ring
-            dot_pen = QPen(QColor(110, 110, 115), 2.5, Qt.DashLine)
+            dot_pen = QPen(QColor(110, 110, 115), pen_w, Qt.DashLine)
             painter.setPen(dot_pen)
-            painter.drawArc(4, 4, 24, 24, 0, 360 * 16)
+            painter.drawArc(pad, pad, diameter, diameter, 0, 360 * 16)
             
             painter.setPen(QColor("#90A4AE"))
-            font = QFont("Segoe UI", 9, QFont.Bold)
+            font = fit_font("--", max(7, base_font_size - 1))
             painter.setFont(font)
-            painter.drawText(pixmap.rect(), Qt.AlignCenter, "--")
+            painter.drawText(text_rect, Qt.AlignCenter, "--")
             
         painter.end()
         return QIcon(pixmap)

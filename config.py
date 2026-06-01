@@ -10,7 +10,9 @@ DEFAULT_CONFIG = {
     "installed": False,
     "launch_on_startup": True,
     "show_companion_bar": True,
-    "companion_compact_mode": False
+    "companion_compact_mode": False,
+    "tray_icon_font_size": 10,
+    "companion_font_size": 11
 }
 
 APP_IPC_SERVER_NAME = "TaskbarMeteringIPC"
