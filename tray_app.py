@@ -308,8 +308,8 @@ class CircularProgress(QWidget):
         self.update_size()
 
     def update_size(self):
-        # Scale widget size based on font_size: 50px baseline at font 10, up to 80px at font 24
-        size = 50 + max(0, (self.font_size - 10) * 2)
+        # Keep gauge growth strong but bounded so labels and cards can still fit.
+        size = 48 + max(0, (self.font_size - 10) * 3)
         self.setFixedSize(size, size)
         self.update()
 
@@ -330,7 +330,7 @@ class CircularProgress(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         def fit_font(text, preferred_size, min_size=7):
-            target = self.rect().adjusted(10, 10, -10, -10)
+            target = text_rect
             size = max(min_size, int(preferred_size))
             while size >= min_size:
                 font = QFont("Segoe UI", size, QFont.Bold)
@@ -342,9 +342,11 @@ class CircularProgress(QWidget):
             return QFont("Segoe UI", min_size, QFont.Bold)
         
         size = self.width()
-        pad = max(3, int(size * 0.06))
+        pad = max(3, int(size * 0.07))
         diameter = size - (2 * pad)
-        pen_w = max(2.5, size * 0.07)
+        pen_w = max(2.2, size * 0.075)
+        inner_pad = int(pad + pen_w + 1)
+        text_rect = self.rect().adjusted(inner_pad, inner_pad, -inner_pad, -inner_pad)
         
         # Background arc
         bg_pen = QPen(QColor(42, 42, 48), pen_w)
@@ -360,7 +362,7 @@ class CircularProgress(QWidget):
             painter.setPen(QColor("#78909C"))
             font = fit_font("--", max(7, self.font_size - 1))
             painter.setFont(font)
-            painter.drawText(self.rect(), Qt.AlignCenter, "--")
+            painter.drawText(text_rect, Qt.AlignCenter, "--")
         else:
             percent = min(max(self.value, 0.0), self.max_val)
             ratio = percent / self.max_val
@@ -375,7 +377,7 @@ class CircularProgress(QWidget):
             val_str = f"{int(round(self.value))}"
             preferred = self.font_size - 1 if len(val_str) >= 3 else self.font_size
             painter.setFont(fit_font(val_str, preferred))
-            painter.drawText(self.rect(), Qt.AlignCenter, val_str)
+            painter.drawText(text_rect, Qt.AlignCenter, val_str)
         painter.end()
 
 
@@ -787,6 +789,9 @@ class FlyoutPanel(QWidget):
         self.cards.clear()
         self.cfg = config.load_config()
         
+        font_size = self.cfg.get("tray_icon_font_size", 10)
+        gauge_font_size = min(20, max(8, int(font_size)))
+        
         for key in self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]):
             if key not in SENSOR_METADATA:
                 continue
@@ -804,17 +809,21 @@ class FlyoutPanel(QWidget):
             card_layout.setContentsMargins(10, 8, 10, 8)
             card_layout.setSpacing(12)
             
-            progress = CircularProgress(meta["color"], font_size=font_size, parent=card_widget)
+            progress = CircularProgress(meta["color"], font_size=gauge_font_size, parent=card_widget)
             card_layout.addWidget(progress)
             
             text_layout = QVBoxLayout()
             text_layout.setSpacing(2)
+            text_layout.setContentsMargins(0, 2, 0, 2)
             lbl = QLabel(meta["label"])
             lbl.setObjectName("MetricLabel")
+            lbl.setMinimumWidth(120)
             val_lbl = QLabel("--")
             val_lbl.setObjectName("MetricVal")
+            val_lbl.setMinimumWidth(120)
             sub_lbl = QLabel("Waiting for sample")
             sub_lbl.setObjectName("MetricSub")
+            sub_lbl.setMinimumWidth(120)
             text_layout.addWidget(lbl)
             text_layout.addWidget(val_lbl)
             text_layout.addWidget(sub_lbl)
@@ -831,8 +840,11 @@ class FlyoutPanel(QWidget):
             }
             
         item_count = len(self.cards)
-        dyn_height = 80 + (item_count * 68)
-        self.setFixedSize(300, min(max(dyn_height, 150), 550))
+        gauge_size = 48 + max(0, (gauge_font_size - 10) * 3)
+        item_height = max(72, gauge_size + 18)
+        dyn_height = 80 + (item_count * item_height)
+        dashboard_width = min(520, max(320, gauge_size + 250))
+        self.setFixedSize(dashboard_width, min(max(dyn_height, 150), 600))
         self.main_container.setFixedSize(self.width(), self.height())
         
     def update_metrics(self, values, freshness=None):
@@ -1471,8 +1483,8 @@ class MeterTray(QObject):
     def create_sensor_icon(self, key, val):
         base_font_size = int(self.cfg.get("tray_icon_font_size", 10))
 
-        # Keep 32px default while allowing higher-size custom text to render in larger icon variants.
-        icon_size = 32 if base_font_size <= 14 else min(64, 32 + (base_font_size - 14) * 3)
+        # Windows notification area downscales aggressively; keeping 32px yields crisper numerals.
+        icon_size = 32
         pixmap = QPixmap(icon_size, icon_size)
         pixmap.fill(Qt.transparent)
         
@@ -1482,10 +1494,10 @@ class MeterTray(QObject):
         meta = SENSOR_METADATA[key]
         color = QColor(meta["color"])
 
-        pad = max(4, int(icon_size * 0.13))
+        pad = 3
         diameter = icon_size - (2 * pad)
-        pen_w = max(2.2, icon_size * 0.085)
-        text_rect = pixmap.rect().adjusted(pad + 1, pad + 1, -(pad + 1), -(pad + 1))
+        pen_w = 2.6
+        text_rect = pixmap.rect().adjusted(7, 7, -7, -7)
 
         def fit_font(text, preferred_size, min_size=7):
             size = max(min_size, int(preferred_size))
@@ -1517,7 +1529,9 @@ class MeterTray(QObject):
             painter.setPen(QColor("#FFFFFF"))
             val_rounded = int(round(val))
             val_str = f"{val_rounded}"
-            preferred = base_font_size - 1 if len(val_str) >= 3 else base_font_size
+            preferred = min(18, max(10, base_font_size + 2))
+            if len(val_str) >= 3:
+                preferred -= 2
             font = fit_font(val_str, preferred)
             painter.setFont(font)
             
