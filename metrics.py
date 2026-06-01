@@ -1,6 +1,8 @@
 import os
 import subprocess
 import psutil
+import threading
+import json
 
 # Initialize NVML for Nvidia GPU stats
 nvml_initialized = False
@@ -11,8 +13,12 @@ try:
 except Exception:
     pass
 
+_disk_usage_cache = []
+_disk_usage_thread = None
+_disk_usage_proc = None
+
 def cleanup_metrics():
-    global nvml_initialized
+    global nvml_initialized, _disk_usage_proc
     if nvml_initialized:
         try:
             import pynvml
@@ -20,6 +26,13 @@ def cleanup_metrics():
         except Exception:
             pass
         nvml_initialized = False
+        
+    if _disk_usage_proc is not None:
+        try:
+            _disk_usage_proc.kill()
+        except Exception:
+            pass
+        _disk_usage_proc = None
 
 def get_cpu_usage():
     try:
@@ -77,40 +90,75 @@ def get_gpu_metrics():
         pass
     return None, None
 
-def get_disk_usage():
-    # Returns a list of dicts: [{"device": "C:", "percent": 35.4}]
-    disks = []
+def _update_disk_usage():
+    global _disk_usage_cache, _disk_usage_proc
     try:
-        for part in psutil.disk_partitions(all=False):
-            if 'fixed' in part.opts or part.fstype:
-                try:
-                    usage = psutil.disk_usage(part.mountpoint)
+        cmd = ["powershell", "-NoProfile", "-Command",
+               "while($true) { Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Select-Object Name, PercentDiskTime | ConvertTo-Json -Compress; Start-Sleep -Seconds 1 }"]
+        
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        _disk_usage_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, startupinfo=startupinfo)
+        
+        for line in _disk_usage_proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict):
+                    data = [data]
+                
+                disks = []
+                for item in data:
+                    name = item.get("Name", "")
+                    if name == "_Total":
+                        continue
+                    val = item.get("PercentDiskTime", 0)
+                    # Name is usually something like "0 C: D:"
                     disks.append({
-                        "device": part.mountpoint.strip("\\"),
-                        "percent": usage.percent
+                        "device": name,
+                        "percent": float(val)
                     })
-                except Exception:
-                    pass
+                
+                if disks:
+                    _disk_usage_cache = disks
+            except Exception:
+                pass
     except Exception:
         pass
-    # Default to C: if none found
-    if not disks:
-        try:
-            usage = psutil.disk_usage('C:\\')
-            disks.append({"device": "C:", "percent": usage.percent})
-        except Exception:
-            disks.append({"device": "C:", "percent": 0.0})
-    return disks
 
-def get_drive_temp(drive_letter):
-    # Get physical disk temperature for the partition drive letter (e.g. "C:" or "D:")
-    letter = drive_letter.strip("\\").strip(":").strip()
+def get_disk_usage():
+    # Returns a list of dicts: [{"device": "0 C: D:", "percent": 35.4}]
+    global _disk_usage_thread, _disk_usage_cache
+    if _disk_usage_thread is None or not _disk_usage_thread.is_alive():
+        _disk_usage_thread = threading.Thread(target=_update_disk_usage, daemon=True)
+        _disk_usage_thread.start()
+        
+        # Block until the first result is populated
+        import time
+        for _ in range(20):
+            if _disk_usage_cache:
+                break
+            time.sleep(0.1)
+        
+    return _disk_usage_cache
+
+def get_drive_temp(device_name):
+    import re
+    # Extract the disk number (first integer in the string, e.g. "0 C: D:")
+    match = re.search(r'^(\d+)', device_name)
+    if not match:
+        return None
+    disk_num = match.group(1)
+    
     try:
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         
         cmd = ["powershell", "-NoProfile", "-Command",
-               f"Get-Partition -DriveLetter {letter} | Get-Disk | Get-PhysicalDisk | Get-StorageReliabilityCounter | Select-Object -ExpandProperty Temperature"]
+               f"Get-PhysicalDisk | Where-Object DeviceId -eq {disk_num} | Get-StorageReliabilityCounter | Select-Object -ExpandProperty Temperature"]
         
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5, startupinfo=startupinfo)
         if proc.returncode == 0 and proc.stdout.strip():

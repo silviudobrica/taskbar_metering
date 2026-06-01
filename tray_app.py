@@ -81,7 +81,7 @@ def initialize_dynamic_sensors():
         
     for i, d in enumerate(disk_list):
         dev_name = d["device"]
-        dev_clean = dev_name.lower().replace(":", "")
+        dev_clean = dev_name.lower().replace(":", "").replace(" ", "_")
         
         # Disk usage sensor
         usage_key = f"disk_usage_{dev_clean}"
@@ -1453,7 +1453,7 @@ class MeterTray(QObject):
         # Populate each dynamic disk partition usage and temperature
         for d in disk_usage_list:
             dev_name = d["device"]
-            dev_clean = dev_name.lower().replace(':', '')
+            dev_clean = dev_name.lower().replace(':', '').replace(' ', '_')
             
             usage_key = f"disk_usage_{dev_clean}"
             values[usage_key] = d["percent"]
