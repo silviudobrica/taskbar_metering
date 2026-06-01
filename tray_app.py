@@ -668,10 +668,10 @@ class FlyoutPanel(QWidget):
     def init_ui(self):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(300, 480)
+        self.setFixedSize(400, 560)
         
         self.main_container = QWidget(self)
-        self.main_container.setFixedSize(300, 480)
+        self.main_container.setFixedSize(400, 560)
         
         self.main_container.setStyleSheet("""
             QWidget#MainContainer {
@@ -754,9 +754,30 @@ class FlyoutPanel(QWidget):
         header.addWidget(self.settings_btn)
         layout.addLayout(header)
         
-        self.list_layout = QVBoxLayout()
+        # Scroll area keeps the panel at a fixed size; no resize = no visual trails
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea { background-color: transparent; border: none; }
+            QScrollBar:vertical {
+                background: transparent; width: 6px; margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.18); border-radius: 3px; min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+        self.scroll_content = QWidget()
+        self.scroll_content.setStyleSheet("background-color: transparent;")
+        self.list_layout = QVBoxLayout(self.scroll_content)
         self.list_layout.setSpacing(8)
-        layout.addLayout(self.list_layout)
+        self.list_layout.setContentsMargins(0, 0, 4, 0)
+        self.list_layout.addStretch()
+        self.scroll_area.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll_area, 1)
 
         self.shortcut_hint = QLabel(
             "Shortcuts: Ctrl +/- tray size, Ctrl+Shift +/- companion size",
@@ -765,9 +786,7 @@ class FlyoutPanel(QWidget):
         self.shortcut_hint.setObjectName("Hint")
         self.shortcut_hint.setWordWrap(True)
         layout.addWidget(self.shortcut_hint)
-        
-        layout.addStretch()
-        
+
         footer = QHBoxLayout()
         
         self.exit_btn = QPushButton("Exit App")
@@ -781,6 +800,7 @@ class FlyoutPanel(QWidget):
         self.rebuild_cards()
         
     def rebuild_cards(self):
+        # Remove all items; spacer items have no widget so only call deleteLater on real widgets
         while self.list_layout.count():
             child = self.list_layout.takeAt(0)
             if child.widget():
@@ -842,13 +862,15 @@ class FlyoutPanel(QWidget):
                 "status_label": sub_lbl,
                 "meta": meta
             }
-            
-        item_count = len(self.cards)
-        item_height = card_height
-        dyn_height = 170 + (item_count * item_height)
-        dashboard_width = min(520, max(360, gauge_size + 250))
-        self.setFixedSize(dashboard_width, min(max(dyn_height, 300), 680))
-        self.main_container.setFixedSize(self.width(), self.height())
+
+        # Push cards to top inside the scroll area
+        self.list_layout.addStretch()
+
+        # Only adjust width based on gauge size; height stays fixed (scroll area handles overflow)
+        dashboard_width = min(520, max(400, gauge_size + 260))
+        if dashboard_width != self.width():
+            self.setFixedWidth(dashboard_width)
+            self.main_container.setFixedWidth(dashboard_width)
         
     def update_metrics(self, values, freshness=None):
         freshness = freshness or {}
@@ -923,7 +945,6 @@ class TaskbarCompanionBar(QWidget):
         self.anchor = TaskbarAnchor()
         self.labels = {}
         self.active_keys = []
-        self.hidden_count = 0
         self._last_layout_limit = None
         self.compact_three_mode = False
         self.text_size = max(8, min(18, int(text_size)))
@@ -964,6 +985,7 @@ class TaskbarCompanionBar(QWidget):
 
     def rebuild_sensors(self, active_keys):
         self.active_keys = [k for k in active_keys if k in SENSOR_METADATA]
+        self._last_layout_limit = self._get_width_limit()
 
         while self.layout_main.count():
             child = self.layout_main.takeAt(0)
@@ -972,7 +994,6 @@ class TaskbarCompanionBar(QWidget):
 
         self.labels.clear()
         visible_keys = self._compute_visible_keys()
-        self.hidden_count = max(0, len(self.active_keys) - len(visible_keys))
 
         for key in visible_keys:
             label = QLabel(f"{SENSOR_METADATA[key]['short']}: --")
@@ -980,13 +1001,6 @@ class TaskbarCompanionBar(QWidget):
             label.setFont(QFont("Segoe UI", self.text_size, QFont.Bold))
             self.layout_main.addWidget(label)
             self.labels[key] = label
-
-        if self.hidden_count > 0:
-            more = QLabel(f"+{self.hidden_count}")
-            more.setObjectName("CompanionMetric")
-            more.setFont(QFont("Segoe UI", self.text_size, QFont.Bold))
-            more.setToolTip("Additional sensors are hidden due to limited taskbar space")
-            self.layout_main.addWidget(more)
 
         self.layout_main.addStretch()
         self._resize_to_content()
@@ -1032,28 +1046,15 @@ class TaskbarCompanionBar(QWidget):
     def _get_width_limit(self):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         if screen is None:
-            return 520
+            return 900
         avail = screen.availableGeometry().width()
-        return max(240, min(560, int(avail * 0.45)))
+        return max(240, int(avail * 0.85))
 
     def _compute_visible_keys(self):
         if self.compact_three_mode:
             return self.active_keys[:3]
-
-        width_limit = self._get_width_limit()
-        self._last_layout_limit = width_limit
-
-        # Approximate per-metric width budget in this compact bar.
-        slot_width = 92
-        base_padding = 24
-        capacity = max(1, int((width_limit - base_padding) / slot_width))
-
-        if len(self.active_keys) <= capacity:
-            return self.active_keys
-
-        # Reserve one slot for +N overflow indicator when truncated.
-        visible_capacity = max(1, capacity - 1)
-        return self.active_keys[:visible_capacity]
+        # Always show all active sensors; the bar grows to fit them
+        return self.active_keys
 
     def _refresh_layout_if_needed(self):
         current_limit = self._get_width_limit()
@@ -1280,18 +1281,11 @@ class MeterTray(QObject):
         for act in self.icon_size_group.actions():
             act.setChecked(int(act.data()) == clamped)
 
-        # Rebuild flyout cards so both gauge geometry and panel size are recalculated.
-        was_visible = self.flyout.isVisible()
-        if was_visible:
-            # Hide briefly to force a clean Qt layout recalculation on resize down
-            self.flyout.hide()
-
+        # Rebuild cards in-place; no hide/show to avoid visual glitches on resize
         self.flyout.rebuild_cards()
-        
-        if was_visible:
+        if self.flyout.isVisible():
             self.flyout.position_above_clock()
-            self.flyout.show()
-            self.flyout.activateWindow()
+            self.flyout.update()
 
         self.poll_metrics()
 
