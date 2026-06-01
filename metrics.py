@@ -94,7 +94,7 @@ def _update_disk_usage():
     global _disk_usage_cache, _disk_usage_proc
     try:
         cmd = ["powershell", "-NoProfile", "-Command",
-               "while($true) { Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Select-Object Name, PercentDiskTime | ConvertTo-Json -Compress; Start-Sleep -Seconds 1 }"]
+               "while($true) { Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Select-Object Name, PercentIdleTime | ConvertTo-Json -Compress; Start-Sleep -Seconds 1 }"]
         
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -115,11 +115,13 @@ def _update_disk_usage():
                     name = item.get("Name", "")
                     if name == "_Total":
                         continue
-                    val = item.get("PercentDiskTime", 0)
-                    # Name is usually something like "0 C: D:"
+                    # PercentIdleTime is guaranteed 0-100%; derive busy from it.
+                    # PercentDiskTime can exceed 100% due to queue-based counting.
+                    idle = float(item.get("PercentIdleTime", 100))
+                    busy = max(0.0, min(100.0, 100.0 - idle))
                     disks.append({
                         "device": name,
-                        "percent": float(val)
+                        "percent": round(busy, 1)
                     })
                 
                 if disks:
