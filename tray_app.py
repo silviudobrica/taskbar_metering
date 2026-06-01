@@ -2,16 +2,18 @@ import sys
 import os
 import time
 import ctypes
+import logging
 from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QWidget, 
                              QLabel, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QDialog, QAbstractItemView,
-                             QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea)
+                             QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea,
+                             QSpinBox)
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
                            QAction, QActionGroup, QCursor, QPainterPath, QGuiApplication,
-                           QShortcut, QKeySequence)
-from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject, QSharedMemory
+                           QShortcut, QKeySequence, QDesktopServices)
+from PySide6.QtCore import QTimer, Qt, QSize, QEvent, QObject, QSharedMemory, QAbstractNativeEventFilter, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 import config
@@ -379,6 +381,264 @@ class CircularProgress(QWidget):
             painter.setFont(fit_font(val_str, preferred))
             painter.drawText(text_rect, Qt.AlignCenter, val_str)
         painter.end()
+
+
+class SparklineWidget(QWidget):
+    """Compact historical line graph showing the last N poll readings for one sensor."""
+    def __init__(self, color_hex, max_val=100, max_points=60, parent=None):
+        super().__init__(parent)
+        self.color = QColor(color_hex)
+        self.max_val = float(max_val)
+        self.max_points = max_points
+        self.history = []
+        self.setFixedHeight(28)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_history(self, history):
+        self.history = list(history[-self.max_points:])
+        self.update()
+
+    def paintEvent(self, event):
+        if len(self.history) < 2:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        pad_x, pad_y = 3, 3
+
+        # Subtle background fill
+        painter.fillRect(self.rect(), QColor(255, 255, 255, 8))
+
+        n = len(self.history)
+        step = (w - 2 * pad_x) / max(1, n - 1)
+
+        path = QPainterPath()
+        first = True
+        for i, v in enumerate(self.history):
+            if v is None:
+                first = True
+                continue
+            x = pad_x + i * step
+            ratio = min(1.0, max(0.0, v / self.max_val))
+            y = (h - pad_y) - ratio * (h - 2 * pad_y)
+            if first:
+                path.moveTo(x, y)
+                first = False
+            else:
+                path.lineTo(x, y)
+
+        pen = QPen(self.color, 1.5)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        painter.end()
+
+
+class GlobalHotkeyFilter(QAbstractNativeEventFilter):
+    """Intercepts WM_HOTKEY to invoke a callback without any focused window."""
+    WM_HOTKEY = 0x0312
+
+    def __init__(self, hotkey_id, callback):
+        super().__init__()
+        self.hotkey_id = hotkey_id
+        self.callback = callback
+
+    def nativeEventFilter(self, eventType, message):
+        if eventType == b"windows_generic_MSG":
+            try:
+                class _MSG(ctypes.Structure):
+                    _fields_ = [
+                        ("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                        ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                        ("time", wintypes.DWORD), ("pt", wintypes.POINT),
+                    ]
+                msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
+                if msg.message == self.WM_HOTKEY and msg.wParam == self.hotkey_id:
+                    QTimer.singleShot(0, self.callback)
+                    return True, 0
+            except Exception:
+                pass
+        return False, 0
+
+
+class AboutDialog(QDialog):
+    """Simple About panel with version, license, and GitHub link."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About Taskbar Metering")
+        self.setFixedSize(400, 270)
+        self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
+        self.setStyleSheet("""
+            QDialog { background-color: #121214; color: #ECEFF1; font-family: 'Segoe UI'; }
+            QLabel { color: #ECEFF1; }
+            QLabel#AppTitle { font-size: 20px; font-weight: bold; color: #FFFFFF; }
+            QLabel#Sub { font-size: 12px; color: #90A4AE; }
+            QPushButton {
+                background-color: #1A1A1E; border: 1px solid #2D2D35; color: #B0BEC5;
+                font-size: 12px; font-weight: bold; border-radius: 5px; padding: 8px 16px;
+            }
+            QPushButton:hover { background-color: #2D2D35; color: #FFFFFF; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 20)
+        layout.setSpacing(8)
+
+        title = QLabel("Taskbar Metering")
+        title.setObjectName("AppTitle")
+        layout.addWidget(title)
+
+        ver = QLabel(f"Version {config.APP_VERSION}")
+        ver.setObjectName("Sub")
+        layout.addWidget(ver)
+
+        desc = QLabel(
+            "A lightweight Windows system-tray application that renders\n"
+            "real-time hardware metrics directly alongside the taskbar clock."
+        )
+        desc.setObjectName("Sub")
+        layout.addWidget(desc)
+
+        layout.addSpacing(6)
+
+        lic = QLabel("Licensed under the Apache License 2.0")
+        lic.setObjectName("Sub")
+        layout.addWidget(lic)
+
+        hotkey_lbl = QLabel("Global hotkey: Ctrl + Shift + M  — show/hide dashboard")
+        hotkey_lbl.setObjectName("Sub")
+        layout.addWidget(hotkey_lbl)
+
+        gh = QLabel('<a href="https://github.com/SilviuDobrica/taskbar_metering" '
+                    'style="color:#2979FF;">GitHub Repository</a>')
+        gh.setOpenExternalLinks(True)
+        layout.addWidget(gh)
+
+        layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, 0, Qt.AlignRight)
+
+
+class ThresholdDialog(QDialog):
+    """Configure per-sensor alert thresholds. 0 = disabled."""
+    def __init__(self, on_save_callback, parent=None):
+        super().__init__(parent)
+        self.on_save_callback = on_save_callback
+        self.cfg = config.load_config()
+        self.thresholds = dict(self.cfg.get("thresholds", {}))
+        self.spin_boxes = {}
+        self._init_ui()
+
+    def _init_ui(self):
+        self.setWindowTitle("Alert Thresholds")
+        self.setFixedSize(380, 420)
+        self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
+        self.setStyleSheet("""
+            QDialog { background-color: #121214; color: #ECEFF1; font-family: 'Segoe UI'; }
+            QLabel { color: #ECEFF1; font-size: 12px; }
+            QLabel#Desc { color: #90A4AE; font-size: 11px; }
+            QSpinBox {
+                background-color: #1A1A1E; border: 1px solid #2D2D35;
+                color: #FFFFFF; font-size: 12px; border-radius: 4px; padding: 3px 8px;
+            }
+            QSpinBox:focus { border-color: #2979FF; }
+            QPushButton#PrimaryBtn {
+                background-color: #2979FF; color: white; border: none;
+                font-size: 12px; font-weight: bold; border-radius: 5px; padding: 8px 15px;
+            }
+            QPushButton#PrimaryBtn:hover { background-color: #448AFF; }
+            QPushButton#SecondaryBtn {
+                background-color: #1A1A1E; border: 1px solid #2D2D35; color: #B0BEC5;
+                font-size: 12px; font-weight: bold; border-radius: 5px; padding: 8px 15px;
+            }
+            QPushButton#SecondaryBtn:hover { background-color: #2D2D35; color: #FFFFFF; }
+            QScrollArea { background-color: transparent; border: none; }
+        """)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(12)
+
+        desc = QLabel(
+            "A tray balloon notification fires once per minute when a sensor exceeds its limit.\n"
+            "Set a value to 0 to disable alerts for that sensor."
+        )
+        desc.setObjectName("Desc")
+        desc.setWordWrap(True)
+        main_layout.addWidget(desc)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollBar:vertical { background: transparent; width: 6px; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.18); border-radius: 3px; min-height: 20px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+
+        content = QWidget()
+        content.setStyleSheet("background-color: transparent;")
+        form = QVBoxLayout(content)
+        form.setSpacing(10)
+        form.setContentsMargins(0, 0, 4, 0)
+
+        active = self.cfg.get("active_sensors", [])
+        for key in active:
+            if key not in SENSOR_METADATA:
+                continue
+            meta = SENSOR_METADATA[key]
+            row = QHBoxLayout()
+
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {meta['color']}; font-size: 14px;")
+            dot.setFixedWidth(20)
+
+            lbl = QLabel(meta["label"])
+            lbl.setMinimumWidth(150)
+
+            spin = QSpinBox()
+            spin.setRange(0, int(meta["max"]) * 2)
+            spin.setValue(int(self.thresholds.get(key, 0)))
+            spin.setSuffix(f" {meta['unit']}")
+            spin.setSpecialValueText("Off")
+            spin.setFixedWidth(110)
+
+            row.addWidget(dot)
+            row.addWidget(lbl, 1)
+            row.addWidget(spin)
+            form.addLayout(row)
+            self.spin_boxes[key] = spin
+
+        form.addStretch()
+        scroll.setWidget(content)
+        main_layout.addWidget(scroll, 1)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("SecondaryBtn")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("PrimaryBtn")
+        save_btn.clicked.connect(self._save_and_close)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        main_layout.addLayout(btn_row)
+
+    def _save_and_close(self):
+        for key, spin in self.spin_boxes.items():
+            v = spin.value()
+            if v > 0:
+                self.thresholds[key] = v
+            else:
+                self.thresholds.pop(key, None)
+        self.cfg["thresholds"] = self.thresholds
+        config.save_config(self.cfg)
+        self.on_save_callback(self.thresholds)
+        self.accept()
 
 
 class SensorCard(QFrame):
@@ -780,7 +1040,7 @@ class FlyoutPanel(QWidget):
         layout.addWidget(self.scroll_area, 1)
 
         self.shortcut_hint = QLabel(
-            "Shortcuts: Ctrl +/- tray size, Ctrl+Shift +/- companion size",
+            "Shortcuts: Ctrl+Shift+M toggle  |  Ctrl+/- tray size  |  Ctrl+Shift+/- companion size",
             self
         )
         self.shortcut_hint.setObjectName("Hint")
@@ -813,13 +1073,13 @@ class FlyoutPanel(QWidget):
         # Keep dashboard gauges and text readable even when tray icon size is small.
         gauge_font_size = min(20, max(12, int(font_size)))
         gauge_size = 48 + max(0, (gauge_font_size - 10) * 3)
-        card_height = max(88, gauge_size + 24)
-        
+        card_height = max(120, gauge_size + 54)
+
         for key in self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]):
             if key not in SENSOR_METADATA:
                 continue
             meta = SENSOR_METADATA[key]
-            
+
             card_widget = QWidget()
             card_widget.setStyleSheet("""
                 QWidget {
@@ -828,16 +1088,22 @@ class FlyoutPanel(QWidget):
                     border-radius: 8px;
                 }
             """)
-            card_layout = QHBoxLayout(card_widget)
-            card_layout.setContentsMargins(12, 10, 12, 10)
-            card_layout.setSpacing(12)
             card_widget.setFixedHeight(card_height)
-            
+
+            outer_layout = QVBoxLayout(card_widget)
+            outer_layout.setContentsMargins(12, 8, 12, 6)
+            outer_layout.setSpacing(4)
+
+            # Top row: gauge + text labels
+            top_row = QHBoxLayout()
+            top_row.setSpacing(12)
+            top_row.setContentsMargins(0, 0, 0, 0)
+
             progress = CircularProgress(meta["color"], font_size=gauge_font_size, parent=card_widget)
-            card_layout.addWidget(progress)
-            
+            top_row.addWidget(progress)
+
             text_layout = QVBoxLayout()
-            text_layout.setSpacing(4)
+            text_layout.setSpacing(2)
             text_layout.setContentsMargins(0, 2, 0, 2)
             lbl = QLabel(meta["label"])
             lbl.setObjectName("MetricLabel")
@@ -851,15 +1117,20 @@ class FlyoutPanel(QWidget):
             text_layout.addWidget(lbl)
             text_layout.addWidget(val_lbl)
             text_layout.addWidget(sub_lbl)
-            card_layout.addLayout(text_layout)
-            
-            card_layout.addStretch()
+            top_row.addLayout(text_layout)
+            top_row.addStretch()
+            outer_layout.addLayout(top_row, 1)
+
+            # Sparkline below the top row
+            sparkline = SparklineWidget(meta["color"], max_val=meta["max"])
+            outer_layout.addWidget(sparkline)
             
             self.list_layout.addWidget(card_widget)
             self.cards[key] = {
                 "progress_widget": progress,
                 "value_label": val_lbl,
                 "status_label": sub_lbl,
+                "sparkline": sparkline,
                 "meta": meta
             }
 
@@ -872,15 +1143,16 @@ class FlyoutPanel(QWidget):
             self.setFixedWidth(dashboard_width)
             self.main_container.setFixedWidth(dashboard_width)
         
-    def update_metrics(self, values, freshness=None):
+    def update_metrics(self, values, freshness=None, history=None):
         freshness = freshness or {}
+        history = history or {}
         for key, widgets in self.cards.items():
             val = values.get(key)
             meta = widgets["meta"]
             fresh_info = freshness.get(key, {})
-            
+
             widgets["progress_widget"].set_value(val, meta["max"], meta["unit"])
-            
+
             if val is not None:
                 if "temp" in key:
                     widgets["value_label"].setText(f"{val}{meta['unit']}")
@@ -890,6 +1162,10 @@ class FlyoutPanel(QWidget):
                 widgets["value_label"].setText("N/A")
 
             widgets["status_label"].setText(self._format_freshness(fresh_info, val))
+
+            sparkline = widgets.get("sparkline")
+            if sparkline is not None:
+                sparkline.set_history(history.get(key, []))
                 
     def position_above_clock(self):
         x, y = self.anchor.get_widget_position(self.width(), self.height(), margin=10)
@@ -973,7 +1249,8 @@ class TaskbarCompanionBar(QWidget):
         self.layout_main.setContentsMargins(10, 6, 10, 6)
         self.layout_main.setSpacing(10)
 
-        self.rebuild_sensors(["cpu_usage", "ram_usage"])
+        # Defer sensor population to MeterTray which calls rebuild_sensors with real config
+        self.layout_main.addStretch()
 
         self._anchor_timer = QTimer(self)
         self._anchor_timer.setInterval(1500)
@@ -1107,6 +1384,12 @@ class MeterTray(QObject):
         self.companion_bar.set_compact_mode(self.cfg.get("companion_compact_mode", False))
         self.apply_companion_visibility()
 
+        # Per-sensor poll history (up to 60 samples) for sparklines
+        self._sensor_history = {}
+        # Alert cooldown tracking: last monotonic time an alert was fired per sensor
+        self._alert_cooldowns = {}
+        self._paused = False
+
         # Keep expensive temperature probes off the UI polling path.
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._cpu_temp_future = None
@@ -1124,10 +1407,11 @@ class MeterTray(QObject):
         self.timer.timeout.connect(self.poll_metrics)
         self.update_timer_interval()
         self.timer.start()
-        
+
         self.rebuild_tray_icons()
         self.poll_metrics()
-        
+        self._register_global_hotkey()
+
     def setup_menu(self):
         title_action = QAction("Taskbar Metering", self)
         title_font = QFont()
@@ -1137,13 +1421,22 @@ class MeterTray(QObject):
         self.menu.addAction(title_action)
         self.menu.addSeparator()
         
-        open_flyout = QAction("Open Dashboard Menu", self)
+        open_flyout = QAction("Open Dashboard", self)
         open_flyout.triggered.connect(self.toggle_flyout)
         self.menu.addAction(open_flyout)
-        
+
         config_action = QAction("Configure Sensors & Order...", self)
         config_action.triggered.connect(self.open_config_dialog)
         self.menu.addAction(config_action)
+
+        threshold_action = QAction("Alert Thresholds...", self)
+        threshold_action.triggered.connect(self.open_threshold_dialog)
+        self.menu.addAction(threshold_action)
+
+        self.pause_action = QAction("Pause Monitoring", self, checkable=True)
+        self.pause_action.setChecked(False)
+        self.pause_action.triggered.connect(self.on_pause_toggled)
+        self.menu.addAction(self.pause_action)
         
         self.poll_menu = QMenu("Polling Interval", self.menu)
         self.poll_group = QActionGroup(self)
@@ -1213,7 +1506,13 @@ class MeterTray(QObject):
         self.menu.addAction(self.companion_compact_action)
         
         self.menu.addSeparator()
-        
+
+        about_action = QAction("About Taskbar Metering...", self)
+        about_action.triggered.connect(self.open_about_dialog)
+        self.menu.addAction(about_action)
+
+        self.menu.addSeparator()
+
         uninstall_action = QAction("Uninstall App...", self)
         uninstall_action.triggered.connect(self.trigger_uninstallation)
         self.menu.addAction(uninstall_action)
@@ -1367,10 +1666,6 @@ class MeterTray(QObject):
         self.companion_bar.set_text_size(self.cfg.get("companion_font_size", 11))
         self.flyout.rebuild_cards()
         self.companion_bar.rebuild_sensors(self.cfg.get("active_sensors", ["cpu_usage", "ram_usage"]))
-        # Also update gauge sizes in existing cards
-        font_size = self.cfg.get("tray_icon_font_size", 10)
-        for card_info in self.flyout.cards.values():
-            card_info["progress_widget"].set_font_size(font_size)
         if hasattr(self, "companion_action"):
             self.companion_action.setChecked(self.cfg.get("show_companion_bar", True))
         if hasattr(self, "companion_compact_action"):
@@ -1421,6 +1716,8 @@ class MeterTray(QObject):
             self.tray_icons.append((key, tray_icon))
             
     def poll_metrics(self):
+        if self._paused:
+            return
         now = time.monotonic()
         wall_now = time.time()
         cpu_usage = metrics.get_cpu_usage()
@@ -1456,8 +1753,17 @@ class MeterTray(QObject):
             temp_key = f"disk_temp_{dev_clean}"
             values[temp_key], freshness[temp_key] = self._get_drive_temp_cached(dev_name, now)
         
-        self.flyout.update_metrics(values, freshness)
+        self.flyout.update_metrics(values, freshness, history=self._sensor_history)
         self.companion_bar.update_metrics(values, freshness)
+
+        # Append current values to sparkline history (max 60 samples)
+        for key, val in values.items():
+            buf = self._sensor_history.setdefault(key, [])
+            buf.append(val)
+            if len(buf) > 60:
+                buf.pop(0)
+
+        self._check_thresholds(values)
         
         # Guard in case config mismatch
         if len(self.tray_icons) != len([k for k in self.cfg.get("active_sensors", []) if k in SENSOR_METADATA]):
@@ -1563,6 +1869,96 @@ class MeterTray(QObject):
         else:
             self.quit_app()
 
+    def open_about_dialog(self):
+        dlg = AboutDialog()
+        dlg.exec()
+
+    def open_threshold_dialog(self):
+        self.flyout.hide()
+        dlg = ThresholdDialog(self.on_thresholds_saved)
+        dlg.exec()
+
+    def on_thresholds_saved(self, thresholds):
+        self.cfg["thresholds"] = thresholds
+        # Reset cooldowns so the new limits are checked fresh
+        self._alert_cooldowns.clear()
+
+    def on_pause_toggled(self):
+        self._paused = self.pause_action.isChecked()
+        if self._paused:
+            # Show "--" on all tray icons while paused
+            for key, tray_icon in self.tray_icons:
+                tray_icon.setIcon(self.create_sensor_icon(key, None))
+                tray_icon.setToolTip("Taskbar Metering — monitoring paused")
+        else:
+            # Resume immediately
+            self.poll_metrics()
+
+    def _check_thresholds(self, values):
+        now = time.monotonic()
+        thresholds = self.cfg.get("thresholds", {})
+        cooldown = 60.0
+
+        for key, limit in thresholds.items():
+            if not limit or limit <= 0:
+                continue
+            val = values.get(key)
+            if val is None:
+                continue
+            if val > limit:
+                last = self._alert_cooldowns.get(key, 0.0)
+                if now - last >= cooldown:
+                    self._alert_cooldowns[key] = now
+                    meta = SENSOR_METADATA.get(key, {})
+                    label = meta.get("label", key)
+                    unit = meta.get("unit", "")
+                    msg = f"{label}: {val:.0f}{unit}  (limit: {limit}{unit})"
+                    if self.tray_icons:
+                        self.tray_icons[0][1].showMessage(
+                            "⚠ Threshold Exceeded",
+                            msg,
+                            QSystemTrayIcon.Warning,
+                            6000
+                        )
+                    logging.warning("Threshold exceeded — %s", msg)
+
+    def _register_global_hotkey(self):
+        if os.name != "nt" or not self.cfg.get("hotkey_enabled", True):
+            return
+        try:
+            HOTKEY_ID = 0x4D54   # 'MT'
+            MOD_CONTROL = 0x0002
+            MOD_SHIFT = 0x0004
+            VK_M = 0x4D
+            if ctypes.windll.user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_M):
+                self._hotkey_id = HOTKEY_ID
+                self._hotkey_filter = GlobalHotkeyFilter(HOTKEY_ID, self.toggle_flyout)
+                QApplication.instance().installNativeEventFilter(self._hotkey_filter)
+            else:
+                self._hotkey_id = None
+                self._hotkey_filter = None
+        except Exception:
+            self._hotkey_id = None
+            self._hotkey_filter = None
+
+    def _unregister_global_hotkey(self):
+        if os.name != "nt":
+            return
+        hotkey_id = getattr(self, "_hotkey_id", None)
+        if hotkey_id is not None:
+            try:
+                ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        hotkey_filter = getattr(self, "_hotkey_filter", None)
+        if hotkey_filter is not None:
+            try:
+                QApplication.instance().removeNativeEventFilter(hotkey_filter)
+            except Exception:
+                pass
+        self._hotkey_id = None
+        self._hotkey_filter = None
+
     def setup_ipc_server(self):
         try:
             QLocalServer.removeServer(config.APP_IPC_SERVER_NAME)
@@ -1635,6 +2031,7 @@ class MeterTray(QObject):
         return val, {"state": state, "updated_at": self._disk_temp_updated_at.get(drive_letter)}
             
     def quit_app(self):
+        self._unregister_global_hotkey()
         for _, icon in self.tray_icons:
             icon.hide()
         self.companion_bar.hide()

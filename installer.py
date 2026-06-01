@@ -216,6 +216,7 @@ class InstallerWindow(QWidget):
             else:
                 subprocess.Popen([sys.executable, current_src, "--run"])
             self.close()
+            QApplication.quit()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to run standalone:\n{str(e)}")
         
@@ -252,7 +253,8 @@ class InstallerWindow(QWidget):
                 subprocess.Popen([target_file, "--run"])
             else:
                 subprocess.Popen([sys.executable, target_file, "--run"])
-                
+            QApplication.quit()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to complete installation:\n{str(e)}")
 
@@ -304,12 +306,16 @@ def create_start_menu_shortcut(exe_path):
         programs_dir = os.path.join(os.environ.get("APPDATA"), r"Microsoft\Windows\Start Menu\Programs")
         shortcut_path = os.path.join(programs_dir, "Taskbar Metering.lnk")
         
+        # Escape single quotes in paths to prevent PowerShell injection
+        safe_shortcut = shortcut_path.replace("'", "''")
+        safe_exe = exe_path.replace("'", "''")
+
         ps_cmd = f"""
         $WshShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
-        $Shortcut.TargetPath = '{exe_path}'
+        $Shortcut = $WshShell.CreateShortcut('{safe_shortcut}')
+        $Shortcut.TargetPath = '{safe_exe}'
         $Shortcut.Arguments = '--run'
-        $Shortcut.IconLocation = '{exe_path}'
+        $Shortcut.IconLocation = '{safe_exe}'
         $Shortcut.Save()
         """
         

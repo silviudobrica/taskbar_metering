@@ -1,6 +1,8 @@
 import os
 import json
 
+APP_VERSION = "1.0.0"
+
 DEFAULT_CONFIG = {
     "active_sensors": [
         "cpu_usage",
@@ -12,7 +14,9 @@ DEFAULT_CONFIG = {
     "show_companion_bar": True,
     "companion_compact_mode": False,
     "tray_icon_font_size": 10,
-    "companion_font_size": 11
+    "companion_font_size": 11,
+    "thresholds": {},
+    "hotkey_enabled": True
 }
 
 APP_IPC_SERVER_NAME = "TaskbarMeteringIPC"
