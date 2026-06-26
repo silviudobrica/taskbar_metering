@@ -4,6 +4,26 @@ A lightweight Windows system-tray application that renders real-time hardware me
 
 ---
 
+## What's New in v1.2.0
+
+- **Administrator elevation support** — installer now offers to run the app as admin for better temperature sensor access
+- **Auto-update functionality** — check for new releases from GitHub and automatically upgrade
+- **About dialog** — view version info and check for updates directly from the app  
+- **Add/Remove Programs support** — app now appears in Windows Settings with current version
+- **Improved installer** — better registry entries and program listing
+- **Bug fixes** — fixed command-line argument parsing
+
+---
+
+## What's New in v1.1.0
+
+- **Improved CPU temperature detection** — now tries multiple WMI methods (Win32_TemperatureProbe, MSAcpi_ThermalZoneTemperature) with better error handling and logging
+- **Enhanced disk temperature detection** — multiple fallback methods for better hardware compatibility
+- **Optional WMI module support** — install `pywin32` and `wmi` for faster, more reliable temperature queries
+- **Debug logging** — temperature detection failures are now logged to `%LOCALAPPDATA%\TaskbarMetering\logs\app.log` for troubleshooting
+
+---
+
 ## Features
 
 - **System tray icon** — live metric badges rendered as a custom icon next to the system clock, updating on a configurable interval
@@ -68,6 +88,12 @@ pip install PySide6 psutil pynvml
 ```
 
 > `pynvml` is optional. If no NVIDIA GPU is present, GPU sensors will simply show as unavailable.
+>
+> For improved CPU and disk temperature detection, also install the WMI module:
+> ```powershell
+> pip install pywin32 wmi
+> ```
+> If `wmi` is not installed, the app will fall back to PowerShell WMI queries, which are slower and less reliable.
 
 ### 4. Launch the application
 

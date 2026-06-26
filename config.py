@@ -1,7 +1,7 @@
 import os
 import json
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
 DEFAULT_CONFIG = {
     "active_sensors": [
@@ -10,6 +10,7 @@ DEFAULT_CONFIG = {
     ],
     "poll_rate": 5,  # in seconds
     "installed": False,
+    "run_as_admin": False,
     "launch_on_startup": True,
     "show_companion_bar": True,
     "companion_compact_mode": False,

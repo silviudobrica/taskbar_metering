@@ -1,5 +1,7 @@
 import sys
 import os
+import ctypes
+import subprocess
 import logging
 import logging.handlers
 import argparse
@@ -51,6 +53,36 @@ def run_installer_gui():
     window.show()
     sys.exit(app.exec())
 
+
+def _is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin(args):
+    try:
+        exe_path = os.path.abspath(sys.argv[0])
+        params = " ".join(args)
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
+        return result > 32
+    except Exception:
+        return False
+
+
+def _run_elevated_task_once():
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Run", "/TN", "TaskbarMetering_AutoRun"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
 def main():
     setup_logging()
     parser = argparse.ArgumentParser(description="Taskbar Metering Application")
@@ -59,23 +91,25 @@ def main():
     parser.add_argument("--install", action="store_true", help="Launch the installation wizard")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall the application and clean up configurations")
     
-    args, unknown = parser.parse_known_args()
+    args = parser.parse_args()
     
     if args.uninstall:
         installer.run_uninstallation()
     elif args.install:
         run_installer_gui()
     elif args.run:
+        cfg = config.load_config()
+        if cfg.get("run_as_admin", False) and not _is_admin():
+            if _run_elevated_task_once():
+                return
+            if _relaunch_as_admin(["--run"]):
+                return
         tray_app.run_app(uninstall_callback=installer.run_uninstallation)
     else:
-        # Default behavior:
-        # If already installed, launch directly to tray.
-        # If not installed, launch the installer wizard.
-        cfg = config.load_config()
-        if cfg.get("installed", False):
-            tray_app.run_app(uninstall_callback=installer.run_uninstallation)
-        else:
-            run_installer_gui()
+        # Default: Always show installer GUI
+        # The installer detects installation status and shows appropriate options
+        # (Install, Uninstall, Repair, or Upgrade)
+        run_installer_gui()
 
 if __name__ == "__main__":
     main()

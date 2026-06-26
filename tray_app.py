@@ -3,13 +3,14 @@ import os
 import time
 import ctypes
 import logging
+import threading
 from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QWidget, 
                              QLabel, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QListWidget, QListWidgetItem, QDialog, QAbstractItemView,
                              QGraphicsDropShadowEffect, QCheckBox, QFrame, QScrollArea,
-                             QSpinBox)
+                             QSpinBox, QMessageBox)
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QPen, 
                            QAction, QActionGroup, QCursor, QPainterPath, QGuiApplication,
                            QShortcut, QKeySequence, QDesktopServices)
@@ -18,6 +19,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 import config
 import metrics
+import updater
 
 # Styling constants for sensors
 SENSOR_METADATA = {
@@ -80,6 +82,10 @@ def initialize_dynamic_sensors():
         del SENSOR_METADATA["disk_usage"]
     if "disk_temp" in SENSOR_METADATA:
         del SENSOR_METADATA["disk_temp"]
+    # Clear any previous dynamic RAM temp sensors.
+    for key in list(SENSOR_METADATA.keys()):
+        if key.startswith("ram_temp_"):
+            del SENSOR_METADATA[key]
         
     for i, d in enumerate(disk_list):
         dev_name = d["device"]
@@ -107,6 +113,20 @@ def initialize_dynamic_sensors():
             "device": dev_name
         }
 
+    # Add RAM stick temperatures from DeepCool sensor bridge when available.
+    ram_list = metrics.get_ram_temperatures()
+    for i, r in enumerate(ram_list):
+        label = r.get("label", f"DIMM #{i + 1}")
+        key = f"ram_temp_{i + 1}"
+        SENSOR_METADATA[key] = {
+            "label": f"RAM {label} Temperature",
+            "short": f"R{i + 1}°",
+            "color": "#26C6DA" if i % 2 == 0 else "#29B6F6",
+            "unit": "°C",
+            "max": 100,
+            "ram_label": label,
+        }
+
 def migrate_config_keys():
     try:
         cfg = config.load_config()
@@ -116,6 +136,7 @@ def migrate_config_keys():
         
         dynamic_usages = [k for k in SENSOR_METADATA.keys() if k.startswith("disk_usage_")]
         dynamic_temps = [k for k in SENSOR_METADATA.keys() if k.startswith("disk_temp_")]
+        dynamic_ram_temps = [k for k in SENSOR_METADATA.keys() if k.startswith("ram_temp_")]
         
         for key in active:
             if key == "disk_usage":
@@ -127,6 +148,11 @@ def migrate_config_keys():
                 for dt in dynamic_temps:
                     if dt not in new_active:
                         new_active.append(dt)
+                has_changes = True
+            elif key == "ram_temp":
+                for rt in dynamic_ram_temps:
+                    if rt not in new_active:
+                        new_active.append(rt)
                 has_changes = True
             else:
                 if key not in new_active:
@@ -464,10 +490,11 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
 
 class AboutDialog(QDialog):
     """Simple About panel with version, license, and GitHub link."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, check_updates_callback=None):
         super().__init__(parent)
+        self.check_updates_callback = check_updates_callback
         self.setWindowTitle("About Taskbar Metering")
-        self.setFixedSize(400, 270)
+        self.setFixedSize(450, 320)
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
         self.setStyleSheet("""
             QDialog { background-color: #121214; color: #ECEFF1; font-family: 'Segoe UI'; }
@@ -475,10 +502,19 @@ class AboutDialog(QDialog):
             QLabel#AppTitle { font-size: 20px; font-weight: bold; color: #FFFFFF; }
             QLabel#Sub { font-size: 12px; color: #90A4AE; }
             QPushButton {
-                background-color: #1A1A1E; border: 1px solid #2D2D35; color: #B0BEC5;
                 font-size: 12px; font-weight: bold; border-radius: 5px; padding: 8px 16px;
             }
-            QPushButton:hover { background-color: #2D2D35; color: #FFFFFF; }
+            QPushButton#PrimaryBtn {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2979FF, stop:1 #1565C0);
+                color: white; border: none;
+            }
+            QPushButton#PrimaryBtn:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #448AFF, stop:1 #1E88E5);
+            }
+            QPushButton#SecondaryBtn {
+                background-color: #1A1A1E; border: 1px solid #2D2D35; color: #B0BEC5;
+            }
+            QPushButton#SecondaryBtn:hover { background-color: #2D2D35; color: #FFFFFF; }
         """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 20)
@@ -516,9 +552,56 @@ class AboutDialog(QDialog):
 
         layout.addStretch()
 
+        # Button layout
+        btn_layout = QHBoxLayout()
+        
+        update_btn = QPushButton("Check for Updates")
+        update_btn.setObjectName("PrimaryBtn")
+        update_btn.clicked.connect(self.check_for_updates)
+        btn_layout.addWidget(update_btn)
+        
         close_btn = QPushButton("Close")
+        close_btn.setObjectName("SecondaryBtn")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, 0, Qt.AlignRight)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+
+    def check_for_updates(self):
+        """Check for updates in a background thread"""
+        if self.check_updates_callback:
+            self.check_updates_callback()
+        else:
+            # Default implementation
+            self.setEnabled(False)
+            thread = threading.Thread(target=self._check_updates_thread, daemon=True)
+            thread.start()
+
+    def _check_updates_thread(self):
+        """Background thread for checking updates"""
+        try:
+            newer, tag = updater.is_newer_version_available()
+            if newer and tag:
+                QMessageBox.information(
+                    self,
+                    "Update Available",
+                    f"A new version ({tag}) is available!\n\n"
+                    "Would you like to update now?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if QMessageBox.Yes == QMessageBox.Yes:
+                    success, msg = updater.perform_upgrade()
+                    if success:
+                        QMessageBox.information(self, "Update Complete", msg)
+                        self.close()
+                    else:
+                        QMessageBox.warning(self, "Update Failed", msg)
+            else:
+                QMessageBox.information(self, "No Updates", "You are already running the latest version.")
+        except Exception as e:
+            QMessageBox.warning(self, "Check Failed", f"Failed to check for updates: {str(e)}")
+        finally:
+            self.setEnabled(True)
 
 
 class ThresholdDialog(QDialog):
@@ -1725,6 +1808,7 @@ class MeterTray(QObject):
         ram_usage = metrics.get_ram_usage()
         gpu_usage, gpu_temp = metrics.get_gpu_metrics()
         disk_usage_list = metrics.get_disk_usage()
+        ram_temp_list = metrics.get_ram_temperatures()
         
         values = {
             "cpu_usage": cpu_usage,
@@ -1752,6 +1836,11 @@ class MeterTray(QObject):
             
             temp_key = f"disk_temp_{dev_clean}"
             values[temp_key], freshness[temp_key] = self._get_drive_temp_cached(dev_name, now)
+
+        for i, r in enumerate(ram_temp_list):
+            ram_key = f"ram_temp_{i + 1}"
+            values[ram_key] = r.get("temp")
+            freshness[ram_key] = {"state": "fresh", "updated_at": wall_now}
         
         self.flyout.update_metrics(values, freshness, history=self._sensor_history)
         self.companion_bar.update_metrics(values, freshness)
