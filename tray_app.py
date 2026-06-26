@@ -568,28 +568,23 @@ class AboutDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def check_for_updates(self):
-        """Check for updates in a background thread"""
+        """Check for updates from the UI thread to avoid Qt cross-thread dialog issues."""
         if self.check_updates_callback:
             self.check_updates_callback()
-        else:
-            # Default implementation
-            self.setEnabled(False)
-            thread = threading.Thread(target=self._check_updates_thread, daemon=True)
-            thread.start()
+            return
 
-    def _check_updates_thread(self):
-        """Background thread for checking updates"""
+        self.setEnabled(False)
         try:
             newer, tag = updater.is_newer_version_available()
             if newer and tag:
-                QMessageBox.information(
+                reply = QMessageBox.question(
                     self,
                     "Update Available",
-                    f"A new version ({tag}) is available!\n\n"
-                    "Would you like to update now?",
-                    QMessageBox.Yes | QMessageBox.No
+                    f"A new version ({tag}) is available!\n\nWould you like to update now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
                 )
-                if QMessageBox.Yes == QMessageBox.Yes:
+                if reply == QMessageBox.Yes:
                     success, msg = updater.perform_upgrade()
                     if success:
                         QMessageBox.information(self, "Update Complete", msg)
@@ -602,7 +597,6 @@ class AboutDialog(QDialog):
             QMessageBox.warning(self, "Check Failed", f"Failed to check for updates: {str(e)}")
         finally:
             self.setEnabled(True)
-
 
 class ThresholdDialog(QDialog):
     """Configure per-sensor alert thresholds. 0 = disabled."""
