@@ -1,7 +1,7 @@
 import os
 import json
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 DEFAULT_CONFIG = {
     "active_sensors": [

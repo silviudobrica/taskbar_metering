@@ -4,6 +4,17 @@ A lightweight Windows system-tray application that renders real-time hardware me
 
 ---
 
+## What's New in v1.3.0
+
+- **HWiNFO-only telemetry backend** — unified, single-source hardware sensor reading via HWiNFO shared memory (Global\HWiNFO_SENS_SM2), eliminating multi-source polling complexity
+- **Removed WMI/PowerShell temperature queries** — no longer depends on `pywin32`, `wmi`, or PowerShell for sensor data; all metrics flow through HWiNFO
+- **Improved CPU temperature detection** — prioritizes motherboard PECI sensors (e.g., ASUS board CPU PECI) for accurate readings on modern AMD/Intel systems
+- **Simplified dependencies** — reduced from ~8 external packages to 3 core libraries (PySide6, psutil, pynvml)
+- **Faster sensor reads** — direct shared-memory access eliminates WMI/PowerShell subprocess overhead
+- **Better hardware compatibility** — works with any system running HWiNFO64 with shared memory support enabled
+
+---
+
 ## What's New in v1.2.0
 
 - **Administrator elevation support** — installer now offers to run the app as admin for better temperature sensor access
